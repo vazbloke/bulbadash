@@ -55,6 +55,9 @@
 
     <!-- Game Container -->
     <div id="game-container" class="mt-8 relative hidden w-full flex justify-center">
+        <!-- Role Badge -->
+        <div id="role-badge" class="absolute top-4 left-4 z-20 px-4 py-1 rounded font-bold text-sm uppercase tracking-wide text-white"></div>
+        
         <!-- Scoreboard -->
         <div class="absolute top-4 left-1/2 transform -translate-x-1/2 flex gap-12 z-10 text-2xl font-bold bg-gray-800 px-6 py-2 rounded-full border-2 border-gray-700 shadow-lg">
             <div class="text-green-400">P1 (Host): <span id="score-p1">0</span></div>
@@ -67,26 +70,30 @@
  * ==========================================
  * GAME CONSTANTS & PHYSICS SETTINGS
  * ==========================================
+ * Strict scalars to ensure deterministic simulation.
+ * By decoupling from framerate, both Client and Host run 
+ * the exact same physics math regardless of monitor Hz.
  */
 const GAME_WIDTH = 800;
 const GAME_HEIGHT = 600;
 const TICK_RATE = 60; 
 const TICK_MS = 1000 / TICK_RATE; 
-const NET_TICK_MODIFIER = 3; 
+const NET_TICK_MODIFIER = 3; // Host broadcasts state every 3 ticks (20Hz)
 
 const PLAYER_SIZE = 32;
 const GRAVITY = 0.8;
 const JUMP_VELOCITY = -14;
 const MOVE_SPEED = 6;
 const DASH_SPEED = 18;
-const DASH_COOLDOWN_TICKS = 90; 
+const DASH_COOLDOWN_TICKS = 90; // 1.5 seconds at 60Hz
 const DASH_DURATION_TICKS = 10;
 
+// Static level layout (AABB bounding boxes)
 const PLATFORMS = [
-    { x: 0, y: 550, w: 800, h: 50 },    
-    { x: 150, y: 400, w: 150, h: 20 },  
-    { x: 500, y: 400, w: 150, h: 20 },  
-    { x: 325, y: 250, w: 150, h: 20 }   
+    { x: 0, y: 550, w: 800, h: 50 },    // Floor
+    { x: 150, y: 400, w: 150, h: 20 },  // Left plat
+    { x: 500, y: 400, w: 150, h: 20 },  // Right plat
+    { x: 325, y: 250, w: 150, h: 20 }   // Top center plat
 ];
 
 /**
@@ -99,14 +106,17 @@ let peer = null;
 let conn = null;
 let bc = null; // BroadcastChannel for local bypass
 
-let currentTick = 0; 
-let lastProcessedClientTick = 0; 
+let currentTick = 0; // Local simulation tick
+let lastProcessedClientTick = 0; // (Host only) Track the last client input processed
 
+// State holds the pure data representation of the game.
+// It is completely detached from the Phaser rendering sprites.
 let hostState = createInitialState(100, 100);
 let clientState = createInitialState(650, 100);
 
-let pendingInputs = []; 
-let clientInputBuffer = []; 
+// Client-Side Prediction arrays
+let pendingInputs = []; // (Client only) Unacknowledged inputs sent to server
+let clientInputBuffer = []; // (Host only) Inputs received from client, waiting to be processed
 
 // Keyboard Input State
 let keys = {};
@@ -127,7 +137,7 @@ if (isLocalMachine) {
     warningBanner.classList.remove('hidden');
 }
 
-// Explicit standard STUN servers
+// Explicit standard STUN servers for public internet NAT traversal
 const peerConfig = {
     debug: 2,
     config: {
@@ -177,6 +187,7 @@ document.getElementById('btn-host').addEventListener('click', () => {
                 if (!document.getElementById('ui-layer').classList.contains('hidden')) {
                     document.getElementById('ui-layer').classList.add('hidden');
                     document.getElementById('game-container').classList.remove('hidden');
+                    setupRoleBadge();
                     if (!phaserGame) startGame();
                 }
             } else if (e.data.type === 'input') {
@@ -227,6 +238,7 @@ document.getElementById('btn-join').addEventListener('click', () => {
                 
                 document.getElementById('ui-layer').classList.add('hidden');
                 document.getElementById('game-container').classList.remove('hidden');
+                setupRoleBadge();
                 if (!phaserGame) startGame();
             } else if (e.data.type === 'state') {
                 handleServerReconciliation(e.data);
@@ -262,7 +274,19 @@ document.getElementById('btn-join').addEventListener('click', () => {
     });
 });
 
+function setupRoleBadge() {
+    const badge = document.getElementById('role-badge');
+    if (isHost) {
+        badge.innerText = "HOST";
+        badge.classList.add('bg-green-600');
+    } else {
+        badge.innerText = "CLIENT";
+        badge.classList.add('bg-blue-600');
+    }
+}
+
 function setupConnectionEvents(connection) {
+    // Diagnostic UI update
     let diagInterval = setInterval(() => {
         if (connection.peerConnection) {
             const state = connection.peerConnection.iceConnectionState;
@@ -296,6 +320,7 @@ function setupConnectionEvents(connection) {
         clearInterval(diagInterval);
         document.getElementById('ui-layer').classList.add('hidden');
         document.getElementById('game-container').classList.remove('hidden');
+        setupRoleBadge();
         if (!phaserGame) startGame(); 
     };
 
@@ -307,9 +332,11 @@ function setupConnectionEvents(connection) {
 
     connection.on('data', (data) => {
         if (isHost && data.type === 'input') {
+            // HOST receives client input. Add to buffer for next tick simulation.
             clientInputBuffer.push(data.input);
         } 
         else if (!isHost && data.type === 'state') {
+            // CLIENT receives authoritative state from Host.
             handleServerReconciliation(data);
         }
     });
@@ -324,67 +351,88 @@ function setupConnectionEvents(connection) {
  * ==========================================
  * PURE PHYSICS ENGINE
  * ==========================================
+ * This function takes a player state and an input object, 
+ * steps the physics forward by exactly one tick (16.66ms), 
+ * checks AABB collisions, and returns the NEW state.
+ * * Crucially, it does NOT touch Phaser sprites. It is a pure data function,
+ * making it perfect for instantaneous rollbacks and fast-forward predictions.
  */
 function stepPhysics(state, input) {
+    // Clone state to avoid mutating historical states during rollback re-simulation
     let nextState = { ...state };
 
+    // 1. Handle Cooldowns
     if (nextState.dashCooldown > 0) nextState.dashCooldown--;
     if (nextState.dashActiveTimer > 0) nextState.dashActiveTimer--;
 
+    // 2. Handle Dash Initiation
     if (input.dash && nextState.dashCooldown === 0) {
         nextState.dashActiveTimer = DASH_DURATION_TICKS;
         nextState.dashCooldown = DASH_COOLDOWN_TICKS;
         
+        // Determine dash direction from input, default to right
         let dx = 0; let dy = 0;
         if (input.left) dx = -1; else if (input.right) dx = 1;
         if (input.up) dy = -1; else if (input.down) dy = 1;
-        if (dx === 0 && dy === 0) dx = 1; 
+        if (dx === 0 && dy === 0) dx = 1; // Default dash direction
 
+        // Normalize
         let length = Math.sqrt(dx*dx + dy*dy);
         nextState.vx = (dx / length) * DASH_SPEED;
         nextState.vy = (dy / length) * DASH_SPEED;
     }
 
+    // 3. Normal Movement (if not currently dashing)
     if (nextState.dashActiveTimer === 0) {
+        // Horizontal friction/movement
         if (input.left) nextState.vx = -MOVE_SPEED;
         else if (input.right) nextState.vx = MOVE_SPEED;
-        else nextState.vx = 0; 
+        else nextState.vx = 0; // Instant friction for tight platforming
 
+        // Gravity
         nextState.vy += GRAVITY;
     }
 
+    // 4. AABB Collision Engine
     let isGrounded = false;
 
+    // Move X
     nextState.x += nextState.vx;
     for (let plat of PLATFORMS) {
         if (checkAABB(nextState.x, nextState.y, PLAYER_SIZE, PLAYER_SIZE, plat.x, plat.y, plat.w, plat.h)) {
+            // Resolve X collision
             if (nextState.vx > 0) nextState.x = plat.x - PLAYER_SIZE;
             else if (nextState.vx < 0) nextState.x = plat.x + plat.w;
             nextState.vx = 0;
         }
     }
 
+    // Move Y
     nextState.y += nextState.vy;
     for (let plat of PLATFORMS) {
         if (checkAABB(nextState.x, nextState.y, PLAYER_SIZE, PLAYER_SIZE, plat.x, plat.y, plat.w, plat.h)) {
-            if (nextState.vy > 0) { 
+            // Resolve Y collision
+            if (nextState.vy > 0) { // Landing on top
                 nextState.y = plat.y - PLAYER_SIZE;
                 isGrounded = true;
-            } else if (nextState.vy < 0) { 
+            } else if (nextState.vy < 0) { // Hitting head
                 nextState.y = plat.y + plat.h;
             }
             nextState.vy = 0;
         }
     }
 
+    // 5. Jump Application (Post-Collision check)
     if (input.jump && isGrounded && nextState.dashActiveTimer === 0) {
         nextState.vy = JUMP_VELOCITY;
     }
 
+    // Screen bounds (wrap around for fun, or just clamp. Let's clamp.)
     if (nextState.x < 0) nextState.x = 0;
     if (nextState.x > GAME_WIDTH - PLAYER_SIZE) nextState.x = GAME_WIDTH - PLAYER_SIZE;
     if (nextState.y < 0) nextState.y = 0;
     if (nextState.y > GAME_HEIGHT) {
+        // Fall off bottom -> Respawn
         nextState.x = 400;
         nextState.y = 100;
         nextState.vy = 0;
@@ -400,15 +448,32 @@ function checkAABB(x1, y1, w1, h1, x2, y2, w2, h2) {
 
 /**
  * ==========================================
- * SERVER RECONCILIATION & ROLLBACK
+ * SERVER RECONCILIATION & ROLLBACK (CRITICAL)
  * ==========================================
+ * This is triggered on the Client whenever it receives a state update from the Host.
  */
 function handleServerReconciliation(data) {
+    // 1. Update the Host's avatar completely. The Host is absolute authority over its own state.
     hostState = data.hostState;
+    
+    // 2. DISCARD PROCESSED INPUTS:
+    // The server tells us 'ackTick', which is the highest client tick it has processed so far.
+    // Any input in our pendingInputs array with a tick <= ackTick has already been applied by the server.
     pendingInputs = pendingInputs.filter(input => input.tick > data.ackTick);
+
+    // 3. SNAP TO SERVER STATE:
+    // We update our local 'baseline' state to exactly what the authoritative server says it was.
     clientState = data.clientState;
+    
+    // UI Update Score
     updateScores(data.hostState.hits, data.clientState.hits);
 
+    // 4. RE-SIMULATE (THE ROLLBACK/FAST-FORWARD LOOP):
+    // Right now, 'clientState' is in the PAST (because network travel takes time).
+    // We must re-apply all of our pending (unacknowledged) inputs to predict where we 
+    // are supposed to be in the PRESENT frame.
+    // Because stepPhysics is a pure function, we can instantly loop through the history 
+    // and arrive at the predicted current state without visual stuttering.
     for (let i = 0; i < pendingInputs.length; i++) {
         clientState = stepPhysics(clientState, pendingInputs[i]);
     }
@@ -423,6 +488,7 @@ function handleServerReconciliation(data) {
 function tick() {
     currentTick++;
 
+    // Process Gamepad Input if available
     let padState = { left: false, right: false, up: false, down: false, dash: false };
     if (phaserGame && phaserGame.input.gamepad && phaserGame.input.gamepad.total > 0) {
         let pad = phaserGame.input.gamepad.getPad(0);
@@ -438,6 +504,7 @@ function tick() {
         padState.dash = pad.A; 
     }
 
+    // Edge Detection for "Just Pressed" actions
     let isUpPressed = keys.up.isDown || padState.up;
     let isDashPressed = keys.dash.isDown || padState.dash;
 
@@ -447,6 +514,7 @@ function tick() {
     prevJumpState = isUpPressed;
     prevDashState = isDashPressed;
 
+    // Gather Local Input
     const input = {
         tick: currentTick,
         left: keys.left.isDown || padState.left,
@@ -458,31 +526,40 @@ function tick() {
     };
 
     if (isHost) {
+        // --- HOST LOGIC (AUTHORITATIVE) ---
+
+        // 1. Apply Host's own input to Host State
         hostState = stepPhysics(hostState, input);
 
-        let latestClientInput = null;
-        while (clientInputBuffer.length > 0) {
-            let nextInput = clientInputBuffer.shift();
-            latestClientInput = nextInput;
-            lastProcessedClientTick = nextInput.tick;
+        // 2. Process ALL client inputs in the buffer sequentially to prevent desync/rubberbanding.
+        // BUGFIX: We MUST step the physics for every single input received to maintain perfect synchronization.
+        if (clientInputBuffer.length > 0) {
+            while (clientInputBuffer.length > 0) {
+                let nextInput = clientInputBuffer.shift();
+                clientState = stepPhysics(clientState, nextInput);
+                lastProcessedClientTick = nextInput.tick;
+            }
+        } else {
+            // Apply a blank input to keep physics moving (gravity) if no network packet arrived this frame
+            clientState = stepPhysics(clientState, { tick: 0, left:false, right:false, up:false, down:false, jump:false, dash:false });
         }
 
-        const cInputToProcess = latestClientInput || { tick: 0, left:false, right:false, up:false, down:false, jump:false, dash:false };
-        clientState = stepPhysics(clientState, cInputToProcess);
-
+        // --- HOST COMBAT/COLLISION CHECK ---
+        // Since Host is authoritative, Host decides if a dash hits.
         if (hostState.dashActiveTimer > 0 && checkAABB(hostState.x, hostState.y, PLAYER_SIZE, PLAYER_SIZE, clientState.x, clientState.y, PLAYER_SIZE, PLAYER_SIZE)) {
             hostState.hits++;
-            clientState.x = 650; clientState.y = 100; 
+            clientState.x = 650; clientState.y = 100; // Respawn Client
             hostState.dashActiveTimer = 0; 
             updateScores(hostState.hits, clientState.hits);
         }
         if (clientState.dashActiveTimer > 0 && checkAABB(clientState.x, clientState.y, PLAYER_SIZE, PLAYER_SIZE, hostState.x, hostState.y, PLAYER_SIZE, PLAYER_SIZE)) {
             clientState.hits++;
-            hostState.x = 100; hostState.y = 100; 
+            hostState.x = 100; hostState.y = 100; // Respawn Host
             clientState.dashActiveTimer = 0;
             updateScores(hostState.hits, clientState.hits);
         }
 
+        // Broadcast Authoritative State at 20Hz (Every 3 Ticks)
         if (currentTick % NET_TICK_MODIFIER === 0 && conn && conn.open) {
             conn.send({
                 type: 'state',
@@ -493,15 +570,35 @@ function tick() {
         }
 
     } else {
+        // --- CLIENT LOGIC (PREDICTION) ---
+
+        // 1. Predict local client state immediately (Client-Side Prediction)
         clientState = stepPhysics(clientState, input);
+        
+        // 2. Store in pending buffer for rollback later
         pendingInputs.push(input);
 
+        // 3. Send input to Authoritative Host
         if (conn && conn.open) {
             conn.send({
                 type: 'input',
                 input: input
             });
         }
+
+        // 4. "DEAD RECKONING" FOR THE HOST (BUGFIXED)
+        // Since we only get Host updates at 20Hz, we manually predict the host's 
+        // physics locally during the 60Hz ticks in between network packets.
+        // We synthesize an input object that matches the Host's current velocity 
+        // to prevent 'instant friction' from halting the Host between ticks.
+        let simulatedHostInput = {
+            tick: 0,
+            left: hostState.vx < -1, // Host was moving left
+            right: hostState.vx > 1, // Host was moving right
+            up: false, down: false, jump: false, dash: false // Jumps/dashes are unpredictable, let them sync on network update
+        };
+        
+        hostState = stepPhysics(hostState, simulatedHostInput);
     }
 }
 
@@ -543,12 +640,14 @@ function startGame() {
 function preload() {}
 
 function create() {
+    // Create Map
     let graphics = this.add.graphics();
     graphics.fillStyle(0x4a5568, 1);
     for(let plat of PLATFORMS) {
         graphics.fillRect(plat.x, plat.y, plat.w, plat.h);
     }
 
+    // Create Players (Squares)
     spriteHost = this.add.rectangle(hostState.x, hostState.y, PLAYER_SIZE, PLAYER_SIZE, 0x48bb78);
     spriteHost.setOrigin(0,0);
     spriteHost.setStrokeStyle(2, 0xffffff);
@@ -557,9 +656,11 @@ function create() {
     spriteClient.setOrigin(0,0);
     spriteClient.setStrokeStyle(2, 0xffffff);
 
+    // Dash Indicators
     dashIndicators.host = this.add.rectangle(0, 0, PLAYER_SIZE, 4, 0x68d391).setOrigin(0,0);
     dashIndicators.client = this.add.rectangle(0, 0, PLAYER_SIZE, 4, 0x63b3ed).setOrigin(0,0);
 
+    // Setup Inputs
     keys = {
         up: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.UP),
         down: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.DOWN),
@@ -571,30 +672,59 @@ function create() {
 
 let accumulator = 0;
 
+// Helper to smoothly interpolate network updates but snap instantly on large distances (e.g. respawning)
+function smoothSnap(sprite, targetState) {
+    if (Math.abs(sprite.x - targetState.x) > 100 || Math.abs(sprite.y - targetState.y) > 100) {
+        // If distance is massive (teleporting/respawning), snap immediately
+        sprite.x = targetState.x;
+        sprite.y = targetState.y;
+    } else {
+        // Otherwise smoothly slide the sprite toward the logical target state (Lerp)
+        sprite.x = Phaser.Math.Linear(sprite.x, targetState.x, 0.4);
+        sprite.y = Phaser.Math.Linear(sprite.y, targetState.y, 0.4);
+    }
+}
+
 function update(time, delta) {
+    // 1. Accumulate Delta Time
     accumulator += delta;
 
+    // 2. Consume accumulator in fixed TICK_MS chunks to ensure simulation speed 
+    // is identical regardless of monitor refresh rate.
     while (accumulator >= TICK_MS) {
-        tick(); 
+        tick(); // Step the physics logic
         accumulator -= TICK_MS;
     }
 
+    // 3. Render (Apply Data State to Visual Sprites)
+    // The physics simulation is entirely headless. Here we sync the UI to the simulated pure data.
     if (spriteHost && spriteClient) {
-        spriteHost.x = hostState.x;
-        spriteHost.y = hostState.y;
         
-        spriteClient.x = clientState.x;
-        spriteClient.y = clientState.y;
+        if (isHost) {
+            // Host is authoritative over itself, update instantly
+            spriteHost.x = hostState.x;
+            spriteHost.y = hostState.y;
+            // Host predicts client through input buffers, but small visual lerp helps hide network jitter
+            smoothSnap(spriteClient, clientState);
+        } else {
+            // Client predicts itself locally perfectly via CSP, update instantly
+            spriteClient.x = clientState.x;
+            spriteClient.y = clientState.y;
+            // Client receives Host at 20Hz and uses Dead Reckoning. Lerp the Host visually to cover small errors.
+            smoothSnap(spriteHost, hostState);
+        }
 
+        // Visual flair: Dash effects
         spriteHost.fillColor = hostState.dashActiveTimer > 0 ? 0xffffff : 0x48bb78;
         spriteClient.fillColor = clientState.dashActiveTimer > 0 ? 0xffffff : 0x4299e1;
 
-        dashIndicators.host.x = hostState.x;
-        dashIndicators.host.y = hostState.y - 10;
+        // Ensure dash bars follow the smoothed sprites, not the raw jagged logical state
+        dashIndicators.host.x = spriteHost.x;
+        dashIndicators.host.y = spriteHost.y - 10;
         dashIndicators.host.width = PLAYER_SIZE * (1 - (hostState.dashCooldown / DASH_COOLDOWN_TICKS));
 
-        dashIndicators.client.x = clientState.x;
-        dashIndicators.client.y = clientState.y - 10;
+        dashIndicators.client.x = spriteClient.x;
+        dashIndicators.client.y = spriteClient.y - 10;
         dashIndicators.client.width = PLAYER_SIZE * (1 - (clientState.dashCooldown / DASH_COOLDOWN_TICKS));
     }
 }
