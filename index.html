@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Showerball - True P2P Rollback Prototype</title>
+    <title>Bulbadash - True P2P Rollback Prototype</title>
     <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.min.js"></script>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
@@ -21,7 +21,7 @@
 
     <!-- UI Overlay for P2P Connection -->
     <div id="ui-layer">
-        <h1 class="text-5xl font-bold mb-8 text-blue-400 tracking-wider">SHOWERBALL</h1>
+        <h1 class="text-5xl font-bold mb-8 text-blue-400 tracking-wider">BULBADASH</h1>
         <p class="mb-8 text-gray-300">True Deterministic P2P Rollback (GGPO-Style)</p>
 
         <!-- Symmetric Matchmaking Panel -->
@@ -38,7 +38,7 @@
         </div>
         
         <div class="mt-8 text-gray-400 text-sm max-w-xl text-center">
-            <strong>Controls:</strong> Arrow Keys / Gamepad D-PAD / Joysticks to Move/Jump. 'SHIFT' or 'A' to Omni-Dash.<br>
+            <strong>Controls:</strong> Arrow Keys / D-PAD / Joystick to Move/Aim. 'A' (or Up) to Jump. 'X'/'B' (or SHIFT) to Dash.<br>
             Dash into the other player to score a hit!
         </div>
     </div>
@@ -106,8 +106,8 @@ let latestRemoteTick = 0; // Used to stall our loop if we run too far ahead of t
 
 // In True P2P, there is only one "Shared Reality" GameState.
 let gameState = {
-    p1: { x: 100, y: 100, vx: 0, vy: 0, dashCooldown: 0, dashActiveTimer: 0, hits: 0 },
-    p2: { x: 650, y: 100, vx: 0, vy: 0, dashCooldown: 0, dashActiveTimer: 0, hits: 0 }
+    p1: createInitialState(100, 100, 1), // Starts facing right (1)
+    p2: createInitialState(650, 100, -1) // Starts facing left (-1)
 };
 
 // The Time Machine History Arrays
@@ -125,6 +125,10 @@ inputHistory[0] = {
 let keys = {};
 let prevJumpState = false;
 let prevDashState = false;
+
+// Variables to track kills and render visual feedback
+let renderP1Hits = 0;
+let renderP2Hits = 0;
 
 // Environment check for local testing bypass
 const isLocalMachine = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
@@ -150,6 +154,20 @@ const peerConfig = {
     }
 };
 
+function createInitialState(startX, startY, startFacingX) {
+    return {
+        x: startX,
+        y: startY,
+        vx: 0,
+        vy: 0,
+        dashCooldown: 0,
+        dashActiveTimer: 0,
+        hits: 0,
+        lastDx: startFacingX, // Track last facing direction for bug-free stationary dashing
+        lastDy: 0
+    };
+}
+
 /**
  * ==========================================
  * SYMMETRIC MATCHMAKING (WEBRTC + LOCAL BYPASS)
@@ -163,7 +181,7 @@ document.getElementById('btn-connect').addEventListener('click', () => {
     }
     
     // Prefix to prevent colliding with other random PeerJS users globally
-    const targetRoomId = 'showerball_ggpo_' + rawPassword;
+    const targetRoomId = 'bulbadash_ggpo_' + rawPassword;
     
     const statusText = document.getElementById('matchmaking-status');
     const iceDisplay = document.getElementById('ice-state-display');
@@ -177,7 +195,7 @@ document.getElementById('btn-connect').addEventListener('click', () => {
 
     // --- LOCAL SAME-MACHINE BYPASS (SYMMETRIC NEGOTIATION) ---
     if (isLocalMachine) {
-        bc = new BroadcastChannel('showerball_local_room');
+        bc = new BroadcastChannel('bulbadash_local_room');
         let foundHost = false;
         
         bc.onmessage = (e) => {
@@ -335,17 +353,32 @@ function applyPlayerPhysics(state, input) {
     if (nextState.dashCooldown > 0) nextState.dashCooldown--;
     if (nextState.dashActiveTimer > 0) nextState.dashActiveTimer--;
 
+    // Keep track of the last intended direction for stationary dashes
+    let dx = 0; let dy = 0;
+    if (input.left) dx = -1; else if (input.right) dx = 1;
+    if (input.up) dy = -1; else if (input.down) dy = 1;
+    
+    if (dx !== 0 || dy !== 0) {
+        nextState.lastDx = dx;
+        nextState.lastDy = dy;
+    }
+
     if (input.dash && nextState.dashCooldown === 0) {
         nextState.dashActiveTimer = DASH_DURATION_TICKS;
         nextState.dashCooldown = DASH_COOLDOWN_TICKS;
-        let dx = 0; let dy = 0;
-        if (input.left) dx = -1; else if (input.right) dx = 1;
-        if (input.up) dy = -1; else if (input.down) dy = 1;
-        if (dx === 0 && dy === 0) dx = 1; 
+        
+        let dashDx = dx;
+        let dashDy = dy;
+        
+        // BUGFIX: If no direction is held during dash, dash towards the last saved facing direction
+        if (dashDx === 0 && dashDy === 0) {
+            dashDx = nextState.lastDx;
+            dashDy = nextState.lastDy;
+        }
 
-        let length = Math.sqrt(dx*dx + dy*dy);
-        nextState.vx = (dx / length) * DASH_SPEED;
-        nextState.vy = (dy / length) * DASH_SPEED;
+        let length = Math.sqrt(dashDx*dashDx + dashDy*dashDy);
+        nextState.vx = (dashDx / length) * DASH_SPEED;
+        nextState.vy = (dashDy / length) * DASH_SPEED;
     }
 
     if (nextState.dashActiveTimer === 0) {
@@ -405,8 +438,8 @@ function stepPhysics(prevState, in1, in2) {
     let p2HitP1 = p2.dashActiveTimer > 0 && checkAABB(p2.x, p2.y, PLAYER_SIZE, PLAYER_SIZE, p1.x, p1.y, PLAYER_SIZE, PLAYER_SIZE);
 
     // If both dash into each other, they both die deterministically on both screens!
-    if (p1HitP2) { p1.hits++; p2.x = 650; p2.y = 100; p2.vx = 0; p2.vy = 0; p1.dashActiveTimer = 0; }
-    if (p2HitP1) { p2.hits++; p1.x = 100; p1.y = 100; p1.vx = 0; p1.vy = 0; p2.dashActiveTimer = 0; }
+    if (p1HitP2) { p1.hits++; p2.x = 650; p2.y = 100; p2.vx = 0; p2.vy = 0; p1.dashActiveTimer = 0; p2.lastDx = -1; }
+    if (p2HitP1) { p2.hits++; p1.x = 100; p1.y = 100; p1.vx = 0; p1.vy = 0; p2.dashActiveTimer = 0; p1.lastDx = 1; }
 
     return { p1, p2 };
 }
@@ -517,32 +550,35 @@ function tick() {
     
     currentTick++;
 
-    // Process Input
-    let padState = { left: false, right: false, up: false, down: false, dash: false };
+    // Process Input (Keyboard + Improved Controller Mapping)
+    let padState = { left: false, right: false, up: false, down: false, dash: false, jump: false };
     if (phaserGame && phaserGame.input.gamepad && phaserGame.input.gamepad.total > 0) {
         let pad = phaserGame.input.gamepad.getPad(0);
         let axisH = pad.axes.length > 0 ? pad.axes[0].getValue() : 0;
         let axisV = pad.axes.length > 1 ? pad.axes[1].getValue() : 0;
+        
         padState.left = pad.left || axisH < -0.5;
         padState.right = pad.right || axisH > 0.5;
         padState.up = pad.up || axisV < -0.5;
         padState.down = pad.down || axisV > 0.5;
-        padState.dash = pad.A; 
+        
+        padState.jump = pad.A; // 'A' (bottom face button) to Jump
+        padState.dash = pad.X || pad.B || pad.Y; // 'X' or 'B' to dash
     }
 
-    let isUpPressed = keys.up.isDown || padState.up;
+    let isJumpPressed = keys.up.isDown || padState.jump; // Up arrow still works for keyboard jump
     let isDashPressed = keys.dash.isDown || padState.dash;
 
-    let jumpJustPressed = isUpPressed && !prevJumpState;
+    let jumpJustPressed = isJumpPressed && !prevJumpState;
     let dashJustPressed = isDashPressed && !prevDashState;
 
-    prevJumpState = isUpPressed;
+    prevJumpState = isJumpPressed;
     prevDashState = isDashPressed;
 
     const localInput = {
         left: keys.left.isDown || padState.left,
         right: keys.right.isDown || padState.right,
-        up: keys.up.isDown || padState.up,
+        up: keys.up.isDown || padState.up, // Used for aiming the dash upwards
         down: keys.down.isDown || padState.down,
         jump: jumpJustPressed, 
         dash: dashJustPressed,
@@ -552,7 +588,6 @@ function tick() {
     // Save local input to history
     if (!inputHistory[currentTick]) inputHistory[currentTick] = { p1: null, p2: null };
     
-    // BUGFIX: P2 was accidentally overwriting P1's array slot here!
     if (isPlayerOne) inputHistory[currentTick].p1 = localInput;
     else inputHistory[currentTick].p2 = localInput;
 
@@ -648,6 +683,32 @@ function create() {
 
 let accumulator = 0;
 
+// Helper to create an elegant geometric spark burst for visual impact
+function createSparkBurst(scene, x, y, colorHex) {
+    for (let i = 0; i < 20; i++) {
+        // Create tiny colored rectangles to represent physical sparks
+        let spark = scene.add.rectangle(x + PLAYER_SIZE/2, y + PLAYER_SIZE/2, 8, 8, colorHex);
+        
+        let angle = Math.random() * Math.PI * 2;
+        let speed = 80 + Math.random() * 200;
+        let duration = 400 + Math.random() * 300;
+
+        // Animate them bursting outward, spinning, and shrinking out of existence
+        scene.tweens.add({
+            targets: spark,
+            x: spark.x + Math.cos(angle) * speed,
+            y: spark.y + Math.sin(angle) * speed,
+            alpha: 0,
+            angle: Math.random() * 360,
+            scaleX: 0,
+            scaleY: 0,
+            duration: duration,
+            ease: 'Cubic.easeOut',
+            onComplete: () => spark.destroy()
+        });
+    }
+}
+
 // Visual Detachment: Interpolate rendering to hide Rollback stutters
 function smoothSnap(sprite, targetState) {
     if (Math.abs(sprite.x - targetState.x) > 100 || Math.abs(sprite.y - targetState.y) > 100) {
@@ -666,6 +727,17 @@ function update(time, delta) {
     }
 
     if (spriteP1 && spriteP2) {
+        
+        // Visual Feedback for Kills: Elegant spark burst at the location of the killer
+        if (gameState.p1.hits > renderP1Hits) {
+            createSparkBurst(this, spriteP1.x, spriteP1.y, 0x48bb78); // Green sparks
+            renderP1Hits = gameState.p1.hits;
+        }
+        if (gameState.p2.hits > renderP2Hits) {
+            createSparkBurst(this, spriteP2.x, spriteP2.y, 0x4299e1); // Blue sparks
+            renderP2Hits = gameState.p2.hits;
+        }
+
         // The local player's visual sprite is updated instantly to preserve tight controls.
         // The remote player's sprite is visually smoothed/lerped to hide Rollback teleports.
         if (isPlayerOne) {
