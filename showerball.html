@@ -24,27 +24,17 @@
         <h1 class="text-5xl font-bold mb-8 text-blue-400 tracking-wider">SHOWERBALL</h1>
         <p class="mb-8 text-gray-300">True Deterministic P2P Rollback (GGPO-Style)</p>
 
-        <div class="flex gap-8">
-            <!-- P1 Panel -->
-            <div class="bg-gray-800 p-6 rounded-lg shadow-lg flex flex-col items-center w-80 border-t-4 border-green-500">
-                <h2 class="text-2xl font-semibold mb-4 text-green-400">Host (Player 1)</h2>
-                <button id="btn-host" class="bg-green-600 hover:bg-green-500 text-white font-bold py-2 px-6 rounded transition w-full">Create Room</button>
-                <div id="host-info" class="mt-4 hidden w-full text-center">
-                    <p class="text-sm text-gray-400 mb-1">Your Room ID:</p>
-                    <input type="text" id="host-id-display" readonly class="w-full bg-gray-900 text-center text-green-300 p-2 rounded cursor-copy font-mono text-sm" onclick="this.select()">
-                    <p id="host-status" class="text-xs text-gray-500 mt-2">Waiting for Player 2...</p>
-                    <p id="host-ice-state" class="text-xs text-yellow-400 mt-1 font-mono"></p>
-                </div>
-            </div>
-
-            <!-- P2 Panel -->
-            <div class="bg-gray-800 p-6 rounded-lg shadow-lg flex flex-col items-center w-80 border-t-4 border-blue-500">
-                <h2 class="text-2xl font-semibold mb-4 text-blue-400">Join (Player 2)</h2>
-                <input type="text" id="join-id-input" placeholder="Paste Room ID here" class="w-full bg-gray-900 text-center text-blue-300 p-2 rounded font-mono mb-4 border border-gray-700">
-                <button id="btn-join" class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded transition w-full">Connect</button>
-                <div id="join-info" class="mt-4 hidden text-sm text-yellow-400">Connecting...</div>
-                <p id="client-ice-state" class="text-xs text-yellow-400 mt-1 font-mono"></p>
-            </div>
+        <!-- Symmetric Matchmaking Panel -->
+        <div class="bg-gray-800 p-8 rounded-lg shadow-lg flex flex-col items-center w-96 border-t-4 border-purple-500">
+            <h2 class="text-3xl font-semibold mb-2 text-purple-400">Matchmaking</h2>
+            <p class="text-sm text-gray-400 mb-6 text-center">Enter a shared room password. The first to connect creates the room!</p>
+            
+            <input type="text" id="room-password" placeholder="e.g. SECRET-BASE" class="w-full bg-gray-900 text-center text-purple-200 p-3 rounded font-mono mb-4 border border-gray-700 uppercase tracking-widest text-lg focus:outline-none focus:border-purple-500 transition">
+            
+            <button id="btn-connect" class="bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 px-6 rounded transition w-full text-lg shadow-lg hover:shadow-xl">CONNECT</button>
+            
+            <div id="matchmaking-status" class="mt-6 hidden text-sm text-yellow-400 font-mono text-center h-8"></div>
+            <p id="ice-state-display" class="text-xs text-gray-500 mt-2 font-mono hidden"></p>
         </div>
         
         <div class="mt-8 text-gray-400 text-sm max-w-xl text-center">
@@ -90,11 +80,15 @@ const DASH_COOLDOWN_TICKS = 90; // 1.5 seconds at 60Hz
 const DASH_DURATION_TICKS = 10;
 const HISTORY_BUFFER_SIZE = 120; // 2 seconds of history for rollback
 
+// Tiered arena layout. Platforms spaced to be reachable by a standard jump.
 const PLATFORMS = [
-    { x: 0, y: 550, w: 800, h: 50 },    // Floor
-    { x: 150, y: 400, w: 150, h: 20 },  // Left plat
-    { x: 500, y: 400, w: 150, h: 20 },  // Right plat
-    { x: 325, y: 250, w: 150, h: 20 }   // Top center plat
+    { x: 0,   y: 550, w: 800, h: 50 },  // Floor
+    { x: 100, y: 440, w: 150, h: 20 },  // L1 Left
+    { x: 550, y: 440, w: 150, h: 20 },  // L1 Right
+    { x: 300, y: 330, w: 200, h: 20 },  // L2 Center
+    { x: 50,  y: 220, w: 100, h: 20 },  // L3 Left Outer
+    { x: 650, y: 220, w: 100, h: 20 },  // L3 Right Outer
+    { x: 350, y: 110, w: 100, h: 20 }   // L4 Top Center
 ];
 
 /**
@@ -102,7 +96,7 @@ const PLATFORMS = [
  * TRUE P2P ROLLBACK VARIABLES
  * ==========================================
  */
-let isPlayerOne = true; // Player 1 (Green) creates room, Player 2 (Blue) joins.
+let isPlayerOne = false; // Decided dynamically during the handshake
 let peer = null;
 let conn = null;
 let bc = null; 
@@ -137,7 +131,7 @@ const isLocalMachine = window.location.hostname === 'localhost' || window.locati
 const warningBanner = document.getElementById('insecure-warning');
 
 if (isLocalMachine) {
-    warningBanner.innerHTML = "<strong>Local Tab Mode Active:</strong> WebRTC bypassed for loopback testing. Use Room ID <strong>LOCAL</strong> to play instantly. <em>(Note: Both tabs must be regular windows. Do not mix Incognito and Standard tabs!)</em>";
+    warningBanner.innerHTML = "<strong>Local Tab Mode Active:</strong> WebRTC bypassed for loopback testing. Use any shared password to play instantly. <em>(Note: Both tabs must be regular windows!)</em>";
     warningBanner.classList.add('bg-blue-600');
     warningBanner.classList.remove('hidden');
 } else if (window.location.protocol === 'http:') {
@@ -158,84 +152,131 @@ const peerConfig = {
 
 /**
  * ==========================================
- * NETWORKING SETUP (WEBRTC + LOCAL BYPASS)
+ * SYMMETRIC MATCHMAKING (WEBRTC + LOCAL BYPASS)
  * ==========================================
  */
-document.getElementById('btn-host').addEventListener('click', () => {
-    isPlayerOne = true;
+document.getElementById('btn-connect').addEventListener('click', () => {
+    const rawPassword = document.getElementById('room-password').value.trim().toLowerCase();
+    if (!rawPassword) {
+        alert("Please enter a room password!");
+        return;
+    }
     
+    // Prefix to prevent colliding with other random PeerJS users globally
+    const targetRoomId = 'showerball_ggpo_' + rawPassword;
+    
+    const statusText = document.getElementById('matchmaking-status');
+    const iceDisplay = document.getElementById('ice-state-display');
+    const connectBtn = document.getElementById('btn-connect');
+    
+    statusText.classList.remove('hidden');
+    statusText.innerText = "Searching for room...";
+    statusText.className = "mt-6 text-sm text-yellow-400 font-mono text-center h-8";
+    connectBtn.disabled = true;
+    connectBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+    // --- LOCAL SAME-MACHINE BYPASS (SYMMETRIC NEGOTIATION) ---
     if (isLocalMachine) {
-        document.getElementById('btn-host').classList.add('hidden');
-        document.getElementById('host-info').classList.remove('hidden');
-        document.getElementById('host-id-display').value = "LOCAL";
-        document.getElementById('host-status').innerText = "Waiting for local tab to join...";
-        
         bc = new BroadcastChannel('showerball_local_room');
+        let foundHost = false;
+        
         bc.onmessage = (e) => {
-            if (e.data.type === 'join_req') {
-                bc.postMessage({ type: 'join_ack' }); 
-                document.getElementById('host-status').innerText = "Local client joined! Starting...";
-                conn = { open: true, send: (d) => bc.postMessage(d) }; 
+            if (e.data.room !== targetRoomId) return; // Ignore traffic from other local test rooms
+            
+            if (e.data.type === 'probe' && isPlayerOne) {
+                // We are already hosting this room, tell them we are here!
+                bc.postMessage({ type: 'probe_ack', room: targetRoomId });
+            } else if (e.data.type === 'probe_ack' && !isPlayerOne) {
+                // We found a host! We are Player 2.
+                foundHost = true;
+                statusText.innerText = "Room found! Joining as Player 2...";
+                statusText.classList.replace('text-yellow-400', 'text-green-400');
+                bc.postMessage({ type: 'join_req', room: targetRoomId });
+            } else if (e.data.type === 'join_req' && isPlayerOne) {
+                // The client is officially joining our room.
+                bc.postMessage({ type: 'join_ack', room: targetRoomId });
+                statusText.innerText = "Player 2 joined! Starting...";
+                conn = { open: true, send: (d) => bc.postMessage({room: targetRoomId, ...d}) };
                 launchGameUI();
-            } else if (e.data.type === 'inputs') {
-                handleNetworkData(e.data);
-            }
-        };
-        return;
-    }
-    
-    peer = new Peer(peerConfig);
-    peer.on('open', (id) => {
-        document.getElementById('btn-host').classList.add('hidden');
-        document.getElementById('host-info').classList.remove('hidden');
-        document.getElementById('host-id-display').value = id;
-    });
-
-    peer.on('connection', (connection) => {
-        document.getElementById('host-status').innerText = "Player 2 joining... Negotiating...";
-        conn = connection;
-        setupConnectionEvents(conn);
-    });
-});
-
-document.getElementById('btn-join').addEventListener('click', () => {
-    isPlayerOne = false;
-    const hostId = document.getElementById('join-id-input').value.trim();
-    if(!hostId) return;
-
-    if (isLocalMachine && hostId === "LOCAL") {
-        document.getElementById('join-info').classList.remove('hidden');
-        document.getElementById('join-info').innerText = "Looking for P1 tab...";
-        
-        bc = new BroadcastChannel('showerball_local_room');
-        let hasJoined = false;
-
-        bc.onmessage = (e) => {
-            if (e.data.type === 'join_ack' && !hasJoined) {
-                hasJoined = true;
-                document.getElementById('join-info').innerText = "P1 found! Starting game...";
-                conn = { open: true, send: (d) => bc.postMessage(d) }; 
+            } else if (e.data.type === 'join_ack' && !isPlayerOne) {
+                // Host acknowledged us. Start the game!
+                statusText.innerText = "Joined! Starting...";
+                conn = { open: true, send: (d) => bc.postMessage({room: targetRoomId, ...d}) };
                 launchGameUI();
             } else if (e.data.type === 'inputs') {
                 handleNetworkData(e.data);
             }
         };
         
-        let pingInterval = setInterval(() => {
-            if (hasJoined) clearInterval(pingInterval);
-            else bc.postMessage({ type: 'join_req' });
-        }, 250);
+        // Ping the local network to see if Player 1 is already waiting
+        bc.postMessage({ type: 'probe', room: targetRoomId });
+        
+        // If nobody answers our ping in 300ms, assume the room is empty and BECOME Player 1
+        setTimeout(() => {
+            if (!foundHost && !isPlayerOne) {
+                isPlayerOne = true;
+                statusText.innerText = "Room created! Waiting for Player 2...";
+                statusText.classList.replace('text-yellow-400', 'text-green-400');
+            }
+        }, 300);
+        
         return;
     }
 
-    document.getElementById('join-info').classList.remove('hidden');
-    document.getElementById('join-info').innerText = "Initializing Peer...";
-    
+    // --- NORMAL WEBRTC (SYMMETRIC NEGOTIATION) ---
+    // First, we create a temporary random peer to try and connect to the room password
     peer = new Peer(peerConfig);
+    
     peer.on('open', () => {
-        document.getElementById('join-info').innerText = "Negotiating WebRTC...";
-        conn = peer.connect(hostId); 
-        setupConnectionEvents(conn);
+        statusText.innerText = "Checking if room exists...";
+        
+        // Attempt to join the room
+        conn = peer.connect(targetRoomId);
+        
+        conn.on('open', () => {
+            // SUCCESS! Someone was already hosting this password. We are Player 2.
+            isPlayerOne = false;
+            statusText.innerText = "Room found! Joining as Player 2...";
+            statusText.classList.replace('text-yellow-400', 'text-green-400');
+            setupConnectionEvents(conn);
+        });
+    });
+
+    peer.on('error', (err) => {
+        if (err.type === 'peer-unavailable') {
+            // THE ROOM DOES NOT EXIST YET!
+            // We must destroy our temp peer and BECOME the host using the password as our ID.
+            peer.destroy();
+            
+            statusText.innerText = "Creating room... Waiting for Player 2.";
+            statusText.classList.replace('text-yellow-400', 'text-green-400');
+            isPlayerOne = true;
+            
+            setTimeout(() => {
+                peer = new Peer(targetRoomId, peerConfig);
+                
+                peer.on('open', () => {
+                    peer.on('connection', (incomingConnection) => {
+                        statusText.innerText = "Player 2 joined! Negotiating DataChannel...";
+                        conn = incomingConnection;
+                        setupConnectionEvents(conn);
+                    });
+                });
+                
+                peer.on('error', (hostErr) => {
+                    statusText.innerText = "Error creating room: " + hostErr.type;
+                    statusText.classList.replace('text-green-400', 'text-red-400');
+                    connectBtn.disabled = false;
+                    connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                });
+            }, 500); // Tiny delay ensures the temp peer is fully cleaned up before re-binding
+            
+        } else {
+            statusText.innerText = "Network Error: " + err.type;
+            statusText.classList.replace('text-yellow-400', 'text-red-400');
+            connectBtn.disabled = false;
+            connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+        }
     });
 });
 
@@ -257,11 +298,13 @@ function launchGameUI() {
 }
 
 function setupConnectionEvents(connection) {
+    const iceDisplay = document.getElementById('ice-state-display');
+    iceDisplay.classList.remove('hidden');
+
     let diagInterval = setInterval(() => {
         if (connection.peerConnection) {
             const state = connection.peerConnection.iceConnectionState;
-            const uiElem = isPlayerOne ? document.getElementById('host-ice-state') : document.getElementById('client-ice-state');
-            uiElem.innerText = `ICE State: ${state}`;
+            iceDisplay.innerText = `ICE State: ${state}`;
         }
     }, 500);
 
