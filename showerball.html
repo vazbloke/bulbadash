@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Showerball - P2P Rollback Netcode Prototype</title>
     <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.min.js"></script>
-    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { margin: 0; overflow: hidden; background-color: #1a202c; color: white; font-family: sans-serif; }
@@ -15,6 +15,9 @@
     </style>
 </head>
 <body>
+
+    <!-- Context Warning Banner -->
+    <div id="insecure-warning" class="hidden text-white text-center p-2 text-sm w-full absolute top-0 z-50"></div>
 
     <!-- UI Overlay for P2P Connection -->
     <div id="ui-layer">
@@ -29,7 +32,8 @@
                 <div id="host-info" class="mt-4 hidden w-full text-center">
                     <p class="text-sm text-gray-400 mb-1">Your Room ID:</p>
                     <input type="text" id="host-id-display" readonly class="w-full bg-gray-900 text-center text-green-300 p-2 rounded cursor-copy font-mono text-sm" onclick="this.select()">
-                    <p class="text-xs text-gray-500 mt-2">Waiting for client to join...</p>
+                    <p id="host-status" class="text-xs text-gray-500 mt-2">Waiting for client to join...</p>
+                    <p id="host-ice-state" class="text-xs text-yellow-400 mt-1 font-mono"></p>
                 </div>
             </div>
 
@@ -39,6 +43,7 @@
                 <input type="text" id="join-id-input" placeholder="Paste Room ID here" class="w-full bg-gray-900 text-center text-blue-300 p-2 rounded font-mono mb-4 border border-gray-700">
                 <button id="btn-join" class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded transition w-full">Connect</button>
                 <div id="join-info" class="mt-4 hidden text-sm text-yellow-400">Connecting...</div>
+                <p id="client-ice-state" class="text-xs text-yellow-400 mt-1 font-mono"></p>
             </div>
         </div>
         
@@ -62,28 +67,26 @@
  * ==========================================
  * GAME CONSTANTS & PHYSICS SETTINGS
  * ==========================================
- * Strict scalars to ensure deterministic simulation.
  */
 const GAME_WIDTH = 800;
 const GAME_HEIGHT = 600;
 const TICK_RATE = 60; 
 const TICK_MS = 1000 / TICK_RATE; 
-const NET_TICK_MODIFIER = 3; // Host broadcasts state every 3 ticks (20Hz)
+const NET_TICK_MODIFIER = 3; 
 
 const PLAYER_SIZE = 32;
 const GRAVITY = 0.8;
 const JUMP_VELOCITY = -14;
 const MOVE_SPEED = 6;
 const DASH_SPEED = 18;
-const DASH_COOLDOWN_TICKS = 90; // 1.5 seconds at 60Hz
+const DASH_COOLDOWN_TICKS = 90; 
 const DASH_DURATION_TICKS = 10;
 
-// Static level layout (AABB bounding boxes)
 const PLATFORMS = [
-    { x: 0, y: 550, w: 800, h: 50 },    // Floor
-    { x: 150, y: 400, w: 150, h: 20 },  // Left plat
-    { x: 500, y: 400, w: 150, h: 20 },  // Right plat
-    { x: 325, y: 250, w: 150, h: 20 }   // Top center plat
+    { x: 0, y: 550, w: 800, h: 50 },    
+    { x: 150, y: 400, w: 150, h: 20 },  
+    { x: 500, y: 400, w: 150, h: 20 },  
+    { x: 325, y: 250, w: 150, h: 20 }   
 ];
 
 /**
@@ -94,22 +97,46 @@ const PLATFORMS = [
 let isHost = false;
 let peer = null;
 let conn = null;
+let bc = null; // BroadcastChannel for local bypass
 
-let currentTick = 0; // Local simulation tick
-let lastProcessedClientTick = 0; // (Host only) Track the last client input processed
+let currentTick = 0; 
+let lastProcessedClientTick = 0; 
 
-// State holds the pure data representation of the game
 let hostState = createInitialState(100, 100);
 let clientState = createInitialState(650, 100);
 
-// Client-Side Prediction arrays
-let pendingInputs = []; // (Client only) Unacknowledged inputs sent to server
-let clientInputBuffer = []; // (Host only) Inputs received from client, waiting to be processed
+let pendingInputs = []; 
+let clientInputBuffer = []; 
 
 // Keyboard Input State
 let keys = {};
 let prevJumpState = false;
 let prevDashState = false;
+
+// Check if we are running locally to bypass WebRTC bugs
+const isLocalMachine = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+const warningBanner = document.getElementById('insecure-warning');
+
+if (isLocalMachine) {
+    warningBanner.innerHTML = "<strong>Local Tab Mode Active:</strong> WebRTC bypassed for loopback testing. Use Room ID <strong>LOCAL</strong> to play instantly. <em>(Note: Both tabs must be regular windows. Do not mix Incognito and Standard tabs!)</em>";
+    warningBanner.classList.add('bg-blue-600');
+    warningBanner.classList.remove('hidden');
+} else if (window.location.protocol === 'http:') {
+    warningBanner.innerHTML = "<strong>Warning:</strong> HTTP LAN connections block WebRTC on Android/Mac. Please host via ngrok (HTTPS) for cross-device play.";
+    warningBanner.classList.add('bg-red-600');
+    warningBanner.classList.remove('hidden');
+}
+
+// Explicit standard STUN servers
+const peerConfig = {
+    debug: 2,
+    config: {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+    }
+};
 
 function createInitialState(startX, startY) {
     return {
@@ -125,13 +152,42 @@ function createInitialState(startX, startY) {
 
 /**
  * ==========================================
- * PEERJS NETWORKING SETUP
+ * NETWORKING SETUP (WEBRTC + LOCAL BYPASS)
  * ==========================================
  */
 document.getElementById('btn-host').addEventListener('click', () => {
     isHost = true;
-    peer = new Peer();
     
+    // --- LOCAL SAME-MACHINE BYPASS ---
+    if (isLocalMachine) {
+        document.getElementById('btn-host').classList.add('hidden');
+        document.getElementById('host-info').classList.remove('hidden');
+        document.getElementById('host-id-display').value = "LOCAL";
+        document.getElementById('host-status').innerText = "Waiting for local tab to join...";
+        
+        bc = new BroadcastChannel('showerball_local_room');
+        bc.onmessage = (e) => {
+            if (e.data.type === 'join_req') {
+                // Confirm to the client that the host is ready
+                bc.postMessage({ type: 'join_ack' }); 
+                
+                document.getElementById('host-status').innerText = "Local client joined! Starting...";
+                conn = { open: true, send: (d) => bc.postMessage(d) }; // Mock connection
+                
+                if (!document.getElementById('ui-layer').classList.contains('hidden')) {
+                    document.getElementById('ui-layer').classList.add('hidden');
+                    document.getElementById('game-container').classList.remove('hidden');
+                    if (!phaserGame) startGame();
+                }
+            } else if (e.data.type === 'input') {
+                clientInputBuffer.push(e.data.input);
+            }
+        };
+        return;
+    }
+    
+    // --- NORMAL WEBRTC ---
+    peer = new Peer(peerConfig);
     peer.on('open', (id) => {
         document.getElementById('btn-host').classList.add('hidden');
         document.getElementById('host-info').classList.remove('hidden');
@@ -139,8 +195,14 @@ document.getElementById('btn-host').addEventListener('click', () => {
     });
 
     peer.on('connection', (connection) => {
+        document.getElementById('host-status').innerText = "Client joining... Negotiating DataChannel...";
         conn = connection;
-        setupConnection();
+        setupConnectionEvents(conn);
+    });
+
+    peer.on('error', (err) => {
+        document.getElementById('host-status').innerText = "Network Error: " + err.type;
+        document.getElementById('host-status').classList.add('text-red-400');
     });
 });
 
@@ -149,31 +211,112 @@ document.getElementById('btn-join').addEventListener('click', () => {
     const hostId = document.getElementById('join-id-input').value.trim();
     if(!hostId) return;
 
+    // --- LOCAL SAME-MACHINE BYPASS ---
+    if (isLocalMachine && hostId === "LOCAL") {
+        document.getElementById('join-info').classList.remove('hidden');
+        document.getElementById('join-info').innerText = "Looking for Host tab...";
+        
+        bc = new BroadcastChannel('showerball_local_room');
+        let hasJoined = false;
+
+        bc.onmessage = (e) => {
+            if (e.data.type === 'join_ack' && !hasJoined) {
+                hasJoined = true;
+                document.getElementById('join-info').innerText = "Host found! Starting game...";
+                conn = { open: true, send: (d) => bc.postMessage(d) }; // Mock connection
+                
+                document.getElementById('ui-layer').classList.add('hidden');
+                document.getElementById('game-container').classList.remove('hidden');
+                if (!phaserGame) startGame();
+            } else if (e.data.type === 'state') {
+                handleServerReconciliation(e.data);
+            }
+        };
+        
+        // Actively ping the host tab until it acknowledges
+        let pingInterval = setInterval(() => {
+            if (hasJoined) {
+                clearInterval(pingInterval);
+            } else {
+                bc.postMessage({ type: 'join_req' });
+            }
+        }, 250);
+        
+        return;
+    }
+
+    // --- NORMAL WEBRTC ---
     document.getElementById('join-info').classList.remove('hidden');
-    peer = new Peer();
+    document.getElementById('join-info').innerText = "Initializing Peer...";
     
+    peer = new Peer(peerConfig);
     peer.on('open', () => {
-        conn = peer.connect(hostId);
-        setupConnection();
+        document.getElementById('join-info').innerText = "Negotiating WebRTC...";
+        conn = peer.connect(hostId); 
+        setupConnectionEvents(conn);
+    });
+
+    peer.on('error', (err) => {
+        document.getElementById('join-info').innerText = "Network Error: " + err.type;
+        document.getElementById('join-info').classList.replace('text-yellow-400', 'text-red-400');
     });
 });
 
-function setupConnection() {
-    conn.on('open', () => {
+function setupConnectionEvents(connection) {
+    let diagInterval = setInterval(() => {
+        if (connection.peerConnection) {
+            const state = connection.peerConnection.iceConnectionState;
+            const uiElem = isHost ? document.getElementById('host-ice-state') : document.getElementById('client-ice-state');
+            uiElem.innerText = `ICE State: ${state}`;
+            
+            if (state === 'failed' || state === 'disconnected') {
+                uiElem.classList.replace('text-yellow-400', 'text-red-400');
+            } else if (state === 'connected' || state === 'completed') {
+                uiElem.classList.replace('text-yellow-400', 'text-green-400');
+            }
+        }
+    }, 500);
+
+    let iceTimeout = setTimeout(() => {
+        if (!connection.open) {
+            clearInterval(diagInterval);
+            const msg = "Timeout. Check ICE State below.";
+            if (isHost) {
+                document.getElementById('host-status').innerText = msg;
+                document.getElementById('host-status').classList.replace('text-gray-500', 'text-red-400');
+            } else {
+                document.getElementById('join-info').innerText = msg;
+                document.getElementById('join-info').classList.replace('text-yellow-400', 'text-red-400');
+            }
+        }
+    }, 15000);
+
+    const onOpen = () => {
+        clearTimeout(iceTimeout);
+        clearInterval(diagInterval);
         document.getElementById('ui-layer').classList.add('hidden');
         document.getElementById('game-container').classList.remove('hidden');
-        startGame(); // Start Phaser and the custom game loop
-    });
+        if (!phaserGame) startGame(); 
+    };
 
-    conn.on('data', (data) => {
+    if (connection.open) {
+        onOpen();
+    } else {
+        connection.on('open', onOpen);
+    }
+
+    connection.on('data', (data) => {
         if (isHost && data.type === 'input') {
-            // HOST receives client input. Add to buffer for next tick simulation.
             clientInputBuffer.push(data.input);
         } 
         else if (!isHost && data.type === 'state') {
-            // CLIENT receives authoritative state from Host.
             handleServerReconciliation(data);
         }
+    });
+
+    connection.on('error', (err) => {
+        clearTimeout(iceTimeout);
+        alert("Connection errored out: " + err);
     });
 }
 
@@ -181,91 +324,67 @@ function setupConnection() {
  * ==========================================
  * PURE PHYSICS ENGINE
  * ==========================================
- * This function takes a player state and an input object, 
- * steps the physics forward by exactly one tick (16.66ms), 
- * checks AABB collisions, and returns the NEW state.
- * * Crucially, it does NOT touch Phaser sprites. It is a pure data function,
- * making it perfect for instantaneous rollbacks and fast-forward predictions.
  */
 function stepPhysics(state, input) {
-    // Clone state to avoid mutating historical states during rollback re-simulation
     let nextState = { ...state };
 
-    // 1. Handle Cooldowns
     if (nextState.dashCooldown > 0) nextState.dashCooldown--;
     if (nextState.dashActiveTimer > 0) nextState.dashActiveTimer--;
 
-    // 2. Handle Dash Initiation
     if (input.dash && nextState.dashCooldown === 0) {
         nextState.dashActiveTimer = DASH_DURATION_TICKS;
         nextState.dashCooldown = DASH_COOLDOWN_TICKS;
         
-        // Determine dash direction from input, default to right
         let dx = 0; let dy = 0;
         if (input.left) dx = -1; else if (input.right) dx = 1;
         if (input.up) dy = -1; else if (input.down) dy = 1;
-        if (dx === 0 && dy === 0) dx = 1; // Default dash direction
+        if (dx === 0 && dy === 0) dx = 1; 
 
-        // Normalize
         let length = Math.sqrt(dx*dx + dy*dy);
         nextState.vx = (dx / length) * DASH_SPEED;
         nextState.vy = (dy / length) * DASH_SPEED;
     }
 
-    // 3. Normal Movement (if not currently dashing)
     if (nextState.dashActiveTimer === 0) {
-        // Horizontal friction/movement
         if (input.left) nextState.vx = -MOVE_SPEED;
         else if (input.right) nextState.vx = MOVE_SPEED;
-        else nextState.vx = 0; // Instant friction for tight platforming
+        else nextState.vx = 0; 
 
-        // Gravity
         nextState.vy += GRAVITY;
-
-        // Jump (only allowed if we are grounded, simple heuristic here)
-        // We will set vy to JUMP if input.jump is true and we are on the ground (handled in collision)
     }
 
-    // 4. AABB Collision Engine
     let isGrounded = false;
 
-    // Move X
     nextState.x += nextState.vx;
     for (let plat of PLATFORMS) {
         if (checkAABB(nextState.x, nextState.y, PLAYER_SIZE, PLAYER_SIZE, plat.x, plat.y, plat.w, plat.h)) {
-            // Resolve X collision
             if (nextState.vx > 0) nextState.x = plat.x - PLAYER_SIZE;
             else if (nextState.vx < 0) nextState.x = plat.x + plat.w;
             nextState.vx = 0;
         }
     }
 
-    // Move Y
     nextState.y += nextState.vy;
     for (let plat of PLATFORMS) {
         if (checkAABB(nextState.x, nextState.y, PLAYER_SIZE, PLAYER_SIZE, plat.x, plat.y, plat.w, plat.h)) {
-            // Resolve Y collision
-            if (nextState.vy > 0) { // Landing on top
+            if (nextState.vy > 0) { 
                 nextState.y = plat.y - PLAYER_SIZE;
                 isGrounded = true;
-            } else if (nextState.vy < 0) { // Hitting head
+            } else if (nextState.vy < 0) { 
                 nextState.y = plat.y + plat.h;
             }
             nextState.vy = 0;
         }
     }
 
-    // 5. Jump Application (Post-Collision check)
     if (input.jump && isGrounded && nextState.dashActiveTimer === 0) {
         nextState.vy = JUMP_VELOCITY;
     }
 
-    // Screen bounds (wrap around for fun, or just clamp. Let's clamp.)
     if (nextState.x < 0) nextState.x = 0;
     if (nextState.x > GAME_WIDTH - PLAYER_SIZE) nextState.x = GAME_WIDTH - PLAYER_SIZE;
     if (nextState.y < 0) nextState.y = 0;
     if (nextState.y > GAME_HEIGHT) {
-        // Fall off bottom -> Respawn
         nextState.x = 400;
         nextState.y = 100;
         nextState.vy = 0;
@@ -281,33 +400,15 @@ function checkAABB(x1, y1, w1, h1, x2, y2, w2, h2) {
 
 /**
  * ==========================================
- * SERVER RECONCILIATION & ROLLBACK (CRITICAL)
+ * SERVER RECONCILIATION & ROLLBACK
  * ==========================================
- * This is triggered on the Client whenever it receives a state update from the Host.
  */
 function handleServerReconciliation(data) {
-    // 1. Update the Host's avatar immediately. The Host is absolute authority over its own state.
     hostState = data.hostState;
-    
-    // 2. DISCARD PROCESSED INPUTS:
-    // The server tells us 'ackTick', which is the highest client tick it has processed so far.
-    // Any input in our pendingInputs array with a tick <= ackTick has already been applied by the server.
     pendingInputs = pendingInputs.filter(input => input.tick > data.ackTick);
-
-    // 3. SNAP TO SERVER STATE:
-    // We update our local 'baseline' state to exactly what the authoritative server says it was.
     clientState = data.clientState;
-    
-    // UI Update Score
     updateScores(data.hostState.hits, data.clientState.hits);
 
-    // 4. RE-SIMULATE (THE ROLLBACK/FAST-FORWARD LOOP):
-    // Right now, 'clientState' is in the PAST (because network travel takes time).
-    // We must re-apply all of our pending (unacknowledged) inputs to predict where we 
-    // are supposed to be in the PRESENT frame.
-    // 
-    // Because stepPhysics is a pure function, we can instantly loop through the history 
-    // and arrive at the predicted current state without visual stuttering (if prediction is accurate).
     for (let i = 0; i < pendingInputs.length; i++) {
         clientState = stepPhysics(clientState, pendingInputs[i]);
     }
@@ -322,7 +423,6 @@ function handleServerReconciliation(data) {
 function tick() {
     currentTick++;
 
-    // Process Gamepad Input if available
     let padState = { left: false, right: false, up: false, down: false, dash: false };
     if (phaserGame && phaserGame.input.gamepad && phaserGame.input.gamepad.total > 0) {
         let pad = phaserGame.input.gamepad.getPad(0);
@@ -335,10 +435,9 @@ function tick() {
         padState.right = pad.right || axisH > 0.5 || axisRH > 0.5;
         padState.up = pad.up || axisV < -0.5 || axisRV < -0.5;
         padState.down = pad.down || axisV > 0.5 || axisRV > 0.5;
-        padState.dash = pad.A; // The bottom face button (A on Xbox)
+        padState.dash = pad.A; 
     }
 
-    // Edge Detection for "Just Pressed" actions
     let isUpPressed = keys.up.isDown || padState.up;
     let isDashPressed = keys.dash.isDown || padState.dash;
 
@@ -348,7 +447,6 @@ function tick() {
     prevJumpState = isUpPressed;
     prevDashState = isDashPressed;
 
-    // 1. Gather Input
     const input = {
         tick: currentTick,
         left: keys.left.isDown || padState.left,
@@ -360,70 +458,50 @@ function tick() {
     };
 
     if (isHost) {
-        // --- HOST LOGIC (AUTHORITATIVE) ---
-
-        // Apply Host's own input to Host State
         hostState = stepPhysics(hostState, input);
 
-        // Find the latest client input from the buffer
         let latestClientInput = null;
         while (clientInputBuffer.length > 0) {
             let nextInput = clientInputBuffer.shift();
-            // We want to process them chronologically, but for a simple prototype,
-            // processing the most recent input received during this tick window is acceptable.
             latestClientInput = nextInput;
             lastProcessedClientTick = nextInput.tick;
         }
 
-        // Apply Client's input (if available) to Client State. 
-        // If no new input arrived due to latency, we just apply a "blank" input to keep physics moving (gravity).
         const cInputToProcess = latestClientInput || { tick: 0, left:false, right:false, up:false, down:false, jump:false, dash:false };
         clientState = stepPhysics(clientState, cInputToProcess);
 
-        // --- HOST COMBAT/COLLISION CHECK ---
-        // Since Host is authoritative, Host decides if a dash hits.
         if (hostState.dashActiveTimer > 0 && checkAABB(hostState.x, hostState.y, PLAYER_SIZE, PLAYER_SIZE, clientState.x, clientState.y, PLAYER_SIZE, PLAYER_SIZE)) {
             hostState.hits++;
-            clientState.x = 650; clientState.y = 100; // Respawn Client
-            hostState.dashActiveTimer = 0; // cancel dash
+            clientState.x = 650; clientState.y = 100; 
+            hostState.dashActiveTimer = 0; 
             updateScores(hostState.hits, clientState.hits);
         }
         if (clientState.dashActiveTimer > 0 && checkAABB(clientState.x, clientState.y, PLAYER_SIZE, PLAYER_SIZE, hostState.x, hostState.y, PLAYER_SIZE, PLAYER_SIZE)) {
             clientState.hits++;
-            hostState.x = 100; hostState.y = 100; // Respawn Host
+            hostState.x = 100; hostState.y = 100; 
             clientState.dashActiveTimer = 0;
             updateScores(hostState.hits, clientState.hits);
         }
 
-        // Broadcast Authoritative State at 20Hz
         if (currentTick % NET_TICK_MODIFIER === 0 && conn && conn.open) {
             conn.send({
                 type: 'state',
-                ackTick: lastProcessedClientTick, // Tell client which input we just processed
+                ackTick: lastProcessedClientTick,
                 hostState: hostState,
                 clientState: clientState
             });
         }
 
     } else {
-        // --- CLIENT LOGIC (PREDICTION) ---
-
-        // 1. Predict locally immediately
         clientState = stepPhysics(clientState, input);
-        
-        // 2. Store in pending buffer for reconciliation later
         pendingInputs.push(input);
 
-        // 3. Send input to Authoritative Host
         if (conn && conn.open) {
             conn.send({
                 type: 'input',
                 input: input
             });
         }
-        
-        // Note: Client does NOT simulate Host. Client just waits for Host state updates 
-        // to snap the Host avatar. In a production game, we would interpolate the Host visually.
     }
 }
 
@@ -451,7 +529,7 @@ function startGame() {
         parent: 'game-container',
         backgroundColor: '#2d3748',
         input: {
-            gamepad: true // Enable Gamepad API in Phaser
+            gamepad: true 
         },
         scene: {
             preload: preload,
@@ -462,19 +540,15 @@ function startGame() {
     phaserGame = new Phaser.Game(config);
 }
 
-function preload() {
-    // We'll generate simple textures for the prototype programmatically
-}
+function preload() {}
 
 function create() {
-    // Create Map
     let graphics = this.add.graphics();
     graphics.fillStyle(0x4a5568, 1);
     for(let plat of PLATFORMS) {
         graphics.fillRect(plat.x, plat.y, plat.w, plat.h);
     }
 
-    // Create Players (Squares)
     spriteHost = this.add.rectangle(hostState.x, hostState.y, PLAYER_SIZE, PLAYER_SIZE, 0x48bb78);
     spriteHost.setOrigin(0,0);
     spriteHost.setStrokeStyle(2, 0xffffff);
@@ -483,11 +557,9 @@ function create() {
     spriteClient.setOrigin(0,0);
     spriteClient.setStrokeStyle(2, 0xffffff);
 
-    // Dash Indicators
     dashIndicators.host = this.add.rectangle(0, 0, PLAYER_SIZE, 4, 0x68d391).setOrigin(0,0);
     dashIndicators.client = this.add.rectangle(0, 0, PLAYER_SIZE, 4, 0x63b3ed).setOrigin(0,0);
 
-    // Setup Inputs
     keys = {
         up: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.UP),
         down: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.DOWN),
@@ -497,21 +569,16 @@ function create() {
     };
 }
 
-// Accumulator for Fixed Timestep loop
 let accumulator = 0;
 
 function update(time, delta) {
-    // 1. Accumulate Delta Time
     accumulator += delta;
 
-    // 2. Consume accumulator in fixed TICK_MS chunks to ensure simulation speed is identical regardless of monitor refresh rate.
     while (accumulator >= TICK_MS) {
-        tick(); // Step the physics logic
+        tick(); 
         accumulator -= TICK_MS;
     }
 
-    // 3. Render (Apply Data State to Visual Sprites)
-    // The physics simulation is entirely headless. Here we sync the UI to the simulated pure data.
     if (spriteHost && spriteClient) {
         spriteHost.x = hostState.x;
         spriteHost.y = hostState.y;
@@ -519,11 +586,9 @@ function update(time, delta) {
         spriteClient.x = clientState.x;
         spriteClient.y = clientState.y;
 
-        // Visual flair: Dash effects
         spriteHost.fillColor = hostState.dashActiveTimer > 0 ? 0xffffff : 0x48bb78;
         spriteClient.fillColor = clientState.dashActiveTimer > 0 ? 0xffffff : 0x4299e1;
 
-        // Dash Cooldown Bars
         dashIndicators.host.x = hostState.x;
         dashIndicators.host.y = hostState.y - 10;
         dashIndicators.host.width = PLAYER_SIZE * (1 - (hostState.dashCooldown / DASH_COOLDOWN_TICKS));
