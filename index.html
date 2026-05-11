@@ -56,6 +56,19 @@
             <div class="text-green-400">P1: <span id="score-p1">0</span></div>
             <div class="text-blue-400">P2: <span id="score-p2">0</span></div>
         </div>
+        <div id="touch-controls" class="hidden absolute bottom-8 w-full flex justify-between px-8 z-30 opacity-60 select-none">
+            <div class="grid grid-cols-3 grid-rows-3 gap-2 w-32 h-32">
+                <div></div><button id="btn-up" class="bg-gray-500 rounded-lg active:bg-gray-400"></button><div></div>
+                <button id="btn-left" class="bg-gray-500 rounded-lg active:bg-gray-400"></button>
+                <div class="bg-gray-600 rounded-full scale-50"></div>
+                <button id="btn-right" class="bg-gray-500 rounded-lg active:bg-gray-400"></button>
+                <div></div><button id="btn-down" class="bg-gray-500 rounded-lg active:bg-gray-400"></button><div></div>
+            </div>
+            <div class="flex gap-4 items-end pb-2">
+                <button id="btn-dash" class="w-16 h-16 bg-blue-500 rounded-full text-white font-bold text-xs shadow-lg border-2 border-blue-300 active:scale-95 transition-transform">DASH</button>
+                <button id="btn-jump" class="w-16 h-16 bg-green-500 rounded-full text-white font-bold text-xs shadow-lg border-2 border-green-300 active:scale-95 transition-transform">JUMP</button>
+            </div>
+        </div>
     </div>
 
 <script>
@@ -127,22 +140,30 @@ inputHistory[0] = {
 let keys = {};
 let prevJumpState = false;
 let prevDashState = false;
-// SURGICAL FIX: Added missing global declarations to prevent ReferenceError crash
 let renderP1Hits = 0;
 let renderP2Hits = 0;
 
+let packetDebugGraphics; // Graphic layer for the Network Debug Block
+window.touchState = { left: false, right: false, up: false, down: false, jump: false, dash: false };
+
 // Environment check for local testing bypass
 const warningBanner = document.getElementById('insecure-warning');
-
 if (window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
     warningBanner.innerHTML = "<strong>Warning:</strong> HTTP LAN connections block WebRTC on Android/Mac. Please host via ngrok (HTTPS) for cross-device play.";
     warningBanner.classList.add('bg-red-600');
     warningBanner.classList.remove('hidden');
 }
 
-// SURGICAL FIX: Added pingInterval and Cloudflare STUN to stabilize handheld/laptop Hairpinning issues
+// SURGICAL FIX: Restored the TURN server! If mDNS and NAT Hairpinning block the local connection, 
+// PeerJS will automatically route the traffic through metered.ca.
 const peerConfig = {
-    debug: 2
+    debug: 2,
+    config: {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" }
+        ]
+    }
 };
 
 function createInitialState(startX, startY, startFacingX) {
@@ -286,6 +307,23 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
     });
 }
 
+function setupTouchControls() {
+    // Only show on touch devices
+    if (!('ontouchstart' in window) && navigator.maxTouchPoints === 0) return;
+    document.getElementById('touch-controls').classList.remove('hidden');
+
+    const bindBtn = (id, key) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('touchstart', (e) => { e.preventDefault(); window.touchState[key] = true; }, {passive: false});
+        el.addEventListener('touchend', (e) => { e.preventDefault(); window.touchState[key] = false; }, {passive: false});
+        el.addEventListener('touchcancel', (e) => { e.preventDefault(); window.touchState[key] = false; }, {passive: false});
+    };
+    bindBtn('btn-up', 'up'); bindBtn('btn-down', 'down');
+    bindBtn('btn-left', 'left'); bindBtn('btn-right', 'right');
+    bindBtn('btn-jump', 'jump'); bindBtn('btn-dash', 'dash');
+}
+
 function launchGameUI() {
     if (document.getElementById('ui-layer').classList.contains('hidden')) return;
     document.getElementById('ui-layer').classList.add('hidden');
@@ -300,6 +338,7 @@ function launchGameUI() {
         badge.classList.add('bg-blue-600');
     }
     
+    setupTouchControls();
     // SURGICAL FIX: Safely check for global phaserGame
     if (!phaserGame) startGame(); 
 }
@@ -568,14 +607,14 @@ function tick() {
     let isJumpPressed = false;
     let isDashPressed = false;
 
-    // 1. Check Keyboard Inputs Safely
-    if (keys.left && keys.left.isDown) padState.left = true;
-    if (keys.right && keys.right.isDown) padState.right = true;
-    if (keys.up && keys.up.isDown) padState.up = true;
-    if (keys.down && keys.down.isDown) padState.down = true;
+    // 1. Check Keyboard & Touch Inputs Safely
+    if ((keys.left && keys.left.isDown) || window.touchState.left) padState.left = true;
+    if ((keys.right && keys.right.isDown) || window.touchState.right) padState.right = true;
+    if ((keys.up && keys.up.isDown) || window.touchState.up) padState.up = true;
+    if ((keys.down && keys.down.isDown) || window.touchState.down) padState.down = true;
     
-    if (keys.up && keys.up.isDown) isJumpPressed = true;
-    if (keys.dash && keys.dash.isDown) isDashPressed = true;
+    if ((keys.up && keys.up.isDown) || window.touchState.jump) isJumpPressed = true;
+    if ((keys.dash && keys.dash.isDown) || window.touchState.dash) isDashPressed = true;
 
     // 2. FIX 2: Check Native HTML5 Gamepad API (Bypasses Phaser's delayed Android Handheld detection)
     if (navigator.getGamepads) {
@@ -721,6 +760,10 @@ function create() {
         right: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.RIGHT),
         dash: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT)
     };
+
+    // Initialize the Network Debug Block graphics layer
+    packetDebugGraphics = this.add.graphics();
+    this.add.text(GAME_WIDTH - 122, GAME_HEIGHT - 35, 'NETWORK (60T)', { fontSize: '10px', fill: '#94a3b8', fontFamily: 'monospace' });
 }
 
 let accumulator = 0;
@@ -799,6 +842,24 @@ function update(time, delta) {
 
         dashIndicators.p2.x = spriteP2.x; dashIndicators.p2.y = spriteP2.y - 10;
         dashIndicators.p2.width = PLAYER_SIZE * (1 - (gameState.p2.dashCooldown / DASH_COOLDOWN_TICKS));
+
+        // --- DRAW NETWORK DEBUG BLOCK ---
+        // Loops through the last 60 ticks. Draws Green if the true network packet arrived.
+        // Draws Red if the packet was dropped/delayed and the engine had to Predict the input.
+        if (packetDebugGraphics) {
+            packetDebugGraphics.clear();
+            for (let i = 0; i < 60; i++) {
+                let t = currentTick - 60 + i;
+                if (t < 0) continue;
+                
+                let remoteInput = isPlayerOne ? inputHistory[t]?.p2 : inputHistory[t]?.p1;
+                // If it is missing entirely, or still marked as "isPredicted", it means the real packet hasn't arrived yet
+                let isDropped = !remoteInput || remoteInput.isPredicted;
+                
+                packetDebugGraphics.fillStyle(isDropped ? 0xf43f5e : 0x10b981, 0.8); // Red or Green
+                packetDebugGraphics.fillRect(GAME_WIDTH - 120 + (i * 2), GAME_HEIGHT - 20, 1.5, 12);
+            }
+        }
     }
 }
 </script>
