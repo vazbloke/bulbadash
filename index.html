@@ -413,21 +413,31 @@ function setupConnectionEvents(connection, statusText, connectBtn) {
     const iceDisplay = document.getElementById('ice-state-display');
     iceDisplay.classList.remove('hidden');
 
+    // SURGICAL FIX: Native WebRTC Logging
+    // We wait 500ms for PeerJS to instantiate the raw RTCPeerConnection object, then hook into it.
+    setTimeout(() => {
+        if (connection.peerConnection) {
+            connection.peerConnection.addEventListener('icegatheringstatechange', () => {
+                console.log(`[ICE Gathering]: ${connection.peerConnection.iceGatheringState}`);
+            });
+            connection.peerConnection.addEventListener('iceconnectionstatechange', () => {
+                console.log(`[ICE Connection]: ${connection.peerConnection.iceConnectionState}`);
+            });
+            connection.peerConnection.addEventListener('icecandidateerror', (event) => {
+                console.error(`[ICE Error]: ${event.errorText} on ${event.url}`);
+            });
+        } else {
+            console.warn("[ICE Debug] RTCPeerConnection object not found.");
+        }
+    }, 500);
+
     let diagInterval = setInterval(() => {
         if (connection.peerConnection) {
             const state = connection.peerConnection.iceConnectionState;
             iceDisplay.innerText = `ICE Tunnel: ${state}`;
             
-            // Helpful diagnostic if ICE fails to punch through strict firewalls
             if (state === 'failed' || state === 'disconnected') {
                 iceDisplay.classList.add('text-red-400');
-                if (state === 'failed') {
-                    clearInterval(diagInterval);
-                    statusText.innerText = "Connection blocked by router (NAT). Try another network.";
-                    statusText.classList.replace('text-green-400', 'text-red-400');
-                    connectBtn.disabled = false;
-                    connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                }
             } else {
                 iceDisplay.classList.remove('text-red-400');
             }
