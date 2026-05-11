@@ -16,6 +16,9 @@
 </head>
 <body>
 
+    <!-- Context Warning Banner -->
+    <div id="insecure-warning" class="hidden text-white text-center p-2 text-sm w-full absolute top-0 z-50"></div>
+
     <!-- UI Overlay for P2P Connection -->
     <div id="ui-layer">
         <h1 class="text-5xl font-bold mb-8 text-blue-400 tracking-wider">BULBADASH</h1>
@@ -124,18 +127,26 @@ inputHistory[0] = {
 let keys = {};
 let prevJumpState = false;
 let prevDashState = false;
+// SURGICAL FIX: Added missing global declarations to prevent ReferenceError crash
 let renderP1Hits = 0;
 let renderP2Hits = 0;
 
-// Robust PeerJS config with Free TURN servers.
-// If standard P2P (STUN) fails due to NAT/Hairpinning, traffic is relayed securely through these servers.
+// Environment check for local testing bypass
+const warningBanner = document.getElementById('insecure-warning');
+
+if (window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    warningBanner.innerHTML = "<strong>Warning:</strong> HTTP LAN connections block WebRTC on Android/Mac. Please host via ngrok (HTTPS) for cross-device play.";
+    warningBanner.classList.add('bg-red-600');
+    warningBanner.classList.remove('hidden');
+}
+
+// SURGICAL FIX: Simplified peerConfig to maximize robust connections and avoid TURN race conditions
 const peerConfig = {
     debug: 2,
     config: {
-        iceTransportPolicy: 'all',
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' },
+            { urls: 'stun:stun1.l.google.com:19302' },
             {
                 urls: "turn:openrelay.metered.ca:80",
                 username: "openrelayproject",
@@ -143,11 +154,6 @@ const peerConfig = {
             },
             {
                 urls: "turn:openrelay.metered.ca:443",
-                username: "openrelayproject",
-                credential: "openrelayproject"
-            },
-            {
-                urls: "turn:openrelay.metered.ca:443?transport=tcp",
                 username: "openrelayproject",
                 credential: "openrelayproject"
             }
@@ -180,7 +186,7 @@ document.getElementById('btn-connect').addEventListener('click', () => {
     const rawPassword = document.getElementById('room-password').value.trim().toLowerCase();
     if (!rawPassword) { alert("Please enter a room password!"); return; }
     
-    const targetRoomId = 'bulbadash_v2_' + rawPassword;
+    const targetRoomId = 'qdash_v1_' + rawPassword;
     const statusText = document.getElementById('matchmaking-status');
     const connectBtn = document.getElementById('btn-connect');
     
@@ -191,40 +197,41 @@ document.getElementById('btn-connect').addEventListener('click', () => {
     connectBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
     // 1. Cross-Tab Local Bypass
-    // Instantly routes traffic through browser memory if testing locally on 2 tabs
-    bc = new BroadcastChannel('bulbadash_local_' + targetRoomId);
+    // Instantly routes traffic through browser memory if testing locally on 2 STANDARD tabs
+    bc = new BroadcastChannel('qdash_local_' + targetRoomId);
     let localTabFound = false;
-        
-        bc.onmessage = (e) => {
+
+    bc.onmessage = (e) => {
         if (e.data.type === 'probe') {
-            if (isPlayerOne && window.phaserGame) bc.postMessage({ type: 'probe_ack' });
+            // SURGICAL FIX: Removed `window.phaserGame` check so the Host answers while waiting in the lobby!
+            if (isPlayerOne) bc.postMessage({ type: 'probe_ack' });
         } else if (e.data.type === 'probe_ack') {
             localTabFound = true;
             isPlayerOne = false; // We found a host, so we are P2
             statusText.innerText = "Local tab found! Joining...";
             bc.postMessage({ type: 'join_req' });
-            } else if (e.data.type === 'join_req' && isPlayerOne) {
+        } else if (e.data.type === 'join_req' && isPlayerOne) {
             bc.postMessage({ type: 'join_ack' });
             statusText.innerText = "Local Player 2 joined!";
             conn = { open: true, send: (d) => bc.postMessage(d) }; // Mock network connection
-                launchGameUI();
-            } else if (e.data.type === 'join_ack' && !isPlayerOne) {
+            launchGameUI();
+        } else if (e.data.type === 'join_ack' && !isPlayerOne) {
             statusText.innerText = "Joined local host!";
             conn = { open: true, send: (d) => bc.postMessage(d) }; // Mock network connection
-                launchGameUI();
-            } else if (e.data.type === 'inputs') {
+            launchGameUI();
+        } else if (e.data.type === 'inputs') {
             handleNetworkData(e.data); // Route data to the netcode engine
-            }
-        };
-        
+        }
+    };
+
     bc.postMessage({ type: 'probe' });
-        
+
     // 2. If no local tabs answer within 400ms, initiate robust WebRTC Handshake
-        setTimeout(() => {
+    setTimeout(() => {
         if (!localTabFound) {
             statusText.innerText = "Checking global network (WebRTC)...";
             attemptWebRTCConnection(targetRoomId, statusText, connectBtn);
-            }
+        }
     }, 400);
 });
 
@@ -274,9 +281,9 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
                         setTimeout(() => attemptWebRTCConnection(targetRoomId, statusText, connectBtn), 500);
                     } else {
                         statusText.innerText = "Error: " + hostErr.type;
-                    statusText.classList.replace('text-green-400', 'text-red-400');
-                    connectBtn.disabled = false;
-                    connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                        statusText.classList.replace('text-green-400', 'text-red-400');
+                        connectBtn.disabled = false;
+                        connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
                     }
                 });
             }, 500);
@@ -304,7 +311,8 @@ function launchGameUI() {
         badge.classList.add('bg-blue-600');
     }
     
-    if (!window.phaserGame) startGame(); 
+    // Safely check for global phaserGame
+    if (!phaserGame) startGame(); 
 }
 
 function setupConnectionEvents(connection, statusText, connectBtn) {
@@ -314,8 +322,9 @@ function setupConnectionEvents(connection, statusText, connectBtn) {
     let diagInterval = setInterval(() => {
         if (connection.peerConnection) {
             const state = connection.peerConnection.iceConnectionState;
-            iceDisplay.innerText = `ICE State: ${state}`;
+            iceDisplay.innerText = `ICE Tunnel: ${state}`;
             
+            // Helpful diagnostic if ICE fails to punch through strict firewalls
             if (state === 'failed' || state === 'disconnected') {
                 iceDisplay.classList.add('text-red-400');
                 if (state === 'failed') {
@@ -426,6 +435,7 @@ function applyPlayerPhysics(state, input) {
     if (nextState.x > GAME_WIDTH - PLAYER_SIZE) nextState.x = GAME_WIDTH - PLAYER_SIZE;
     if (nextState.y < 0) nextState.y = 0;
     
+    // Death barrier respawn
     if (nextState.y > GAME_HEIGHT) {
         nextState.x = 400; nextState.y = 100; nextState.vy = 0;
     }
@@ -472,7 +482,10 @@ function handleNetworkData(payload) {
         const rInput = packet.input;
         
         if (rTick > latestRemoteTick) latestRemoteTick = rTick;
-        // Ignore inputs that are incredibly old        if (rTick <= currentTick - HISTORY_BUFFER_SIZE) continue; // Ignore ancient packets
+
+        // Ignore inputs that are incredibly old
+        if (rTick <= currentTick - HISTORY_BUFFER_SIZE) continue;
+
         if (!inputHistory[rTick]) inputHistory[rTick] = { p1: null, p2: null };
         
         // Grab what we PREDICTED the opponent was doing on this specific tick in the past
@@ -561,8 +574,6 @@ function tick() {
     
     currentTick++;
 
-    // Process Input (Keyboard + Improved Controller Mapping)
-    
     let padState = { left: false, right: false, up: false, down: false, dash: false, jump: false };
     if (phaserGame && phaserGame.input.gamepad && phaserGame.input.gamepad.total > 0) {
         let pad = phaserGame.input.gamepad.getPad(0);
@@ -578,8 +589,9 @@ function tick() {
         padState.dash = pad.X || pad.B || pad.Y; 
     }
 
-    let isJumpPressed = keys.up.isDown || padState.jump; 
-    let isDashPressed = keys.dash.isDown || padState.dash;
+    // SURGICAL FIX: Safely check keys to prevent crashes before inputs are loaded
+    let isJumpPressed = (keys.up && keys.up.isDown) || padState.jump; 
+    let isDashPressed = (keys.dash && keys.dash.isDown) || padState.dash;
 
     let jumpJustPressed = isJumpPressed && !prevJumpState;
     let dashJustPressed = isDashPressed && !prevDashState;
@@ -589,10 +601,10 @@ function tick() {
 
     // Gather Local Input
     const localInput = {
-        left: keys.left.isDown || padState.left,
-        right: keys.right.isDown || padState.right,
-        up: keys.up.isDown || padState.up, 
-        down: keys.down.isDown || padState.down,
+        left: (keys.left && keys.left.isDown) || padState.left,
+        right: (keys.right && keys.right.isDown) || padState.right,
+        up: (keys.up && keys.up.isDown) || padState.up, 
+        down: (keys.down && keys.down.isDown) || padState.down,
         jump: jumpJustPressed, 
         dash: dashJustPressed,
         isPredicted: false // This is absolute truth (our own input)
@@ -648,6 +660,7 @@ function updateScores(p1Hits, p2Hits) {
  * PHASER 3 RENDERING & INTEGRATION
  * ==========================================
  */
+let phaserGame; // SURGICAL FIX: Declare the game instance globally to prevent ReferenceErrors in tick()
 let spriteP1;
 let spriteP2;
 let dashIndicators = {};
@@ -663,7 +676,7 @@ function startGame() {
         input: { gamepad: true },
         scene: { preload: preload, create: create, update: update }
     };
-    window.phaserGame = new Phaser.Game(config);
+    phaserGame = new Phaser.Game(config); // SURGICAL FIX: Bind securely to global variable
 }
 
 function preload() {}
@@ -744,11 +757,11 @@ function update(time, delta) {
         
         // Visual Feedback for Kills: Elegant spark burst at the location of the killer
         if (gameState.p1.hits > renderP1Hits) {
-            createSparkBurst(this, spriteP1.x, spriteP1.y, 0x48bb78); // Green sparks
+            createSparkBurst(this, spriteP1.x, spriteP1.y, 0x48bb78); 
             renderP1Hits = gameState.p1.hits;
         }
         if (gameState.p2.hits > renderP2Hits) {
-            createSparkBurst(this, spriteP2.x, spriteP2.y, 0x4299e1); // Blue sparks
+            createSparkBurst(this, spriteP2.x, spriteP2.y, 0x4299e1); 
             renderP2Hits = gameState.p2.hits;
         }
 
