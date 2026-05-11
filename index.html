@@ -235,6 +235,39 @@ document.getElementById('btn-connect').addEventListener('click', () => {
     }, 400);
 });
 
+// Helper function to handle host creation when a room is dead or doesn't exist
+function createHostRoom(targetRoomId, statusText, connectBtn) {
+    statusText.innerText = "Creating room... Waiting for Player 2.";
+    statusText.classList.replace('text-yellow-400', 'text-green-400');
+    isPlayerOne = true;
+    
+    setTimeout(() => {
+        // Reinitialize using the password as our actual PeerJS ID
+        peer = new Peer(targetRoomId, peerConfig);
+        
+        peer.on('open', () => {
+            peer.on('connection', (incomingConnection) => {
+                statusText.innerText = "Player 2 joined! Negotiating connection...";
+                conn = incomingConnection;
+                setupConnectionEvents(conn, statusText, connectBtn);
+            });
+        });
+        
+        peer.on('error', (hostErr) => {
+            if (hostErr.type === 'unavailable-id') {
+                // Race condition caught! Both players clicked simultaneously. Retry join!
+                peer.destroy();
+                setTimeout(() => attemptWebRTCConnection(targetRoomId, statusText, connectBtn), 500);
+            } else {
+                statusText.innerText = "Error: " + hostErr.type;
+                statusText.classList.replace('text-green-400', 'text-red-400');
+                connectBtn.disabled = false;
+                connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        });
+    }, 500);
+}
+
 function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
     if (peer) peer.destroy();
     
@@ -246,7 +279,17 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
         // Attempt to join the room password as a Client
         conn = peer.connect(targetRoomId);
         
+        // SURGICAL FIX: "Ghost Room" Timeout
+        // If the room exists on the signaling server but the host tab was closed without disconnecting,
+        // it will hang forever. We wait 3.5s, then forcefully take over as Host if it fails to open.
+        let connectionTimeout = setTimeout(() => {
+            peer.destroy();
+            statusText.innerText = "Room unresponsive. Taking over as Host...";
+            createHostRoom(targetRoomId, statusText, connectBtn);
+        }, 3500);
+        
         conn.on('open', () => {
+            clearTimeout(connectionTimeout);
             isPlayerOne = false;
             statusText.innerText = "Room found! Joining as Player 2...";
             statusText.classList.replace('text-yellow-400', 'text-green-400');
@@ -256,38 +299,9 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
 
     peer.on('error', (err) => {
         if (err.type === 'peer-unavailable') {
-            // Room does not exist. We destroy our temp peer and become the Host.
+            // Room clearly does not exist. We destroy our temp peer and become the Host.
             peer.destroy();
-            statusText.innerText = "Creating room... Waiting for Player 2.";
-            statusText.classList.replace('text-yellow-400', 'text-green-400');
-            isPlayerOne = true;
-            
-            setTimeout(() => {
-                // Reinitialize using the password as our actual PeerJS ID
-                peer = new Peer(targetRoomId, peerConfig);
-                
-                peer.on('open', () => {
-                    peer.on('connection', (incomingConnection) => {
-                        statusText.innerText = "Player 2 joined! Negotiating connection...";
-                        conn = incomingConnection;
-                        setupConnectionEvents(conn, statusText, connectBtn);
-                    });
-                });
-                
-                peer.on('error', (hostErr) => {
-                    if (hostErr.type === 'unavailable-id') {
-                        // Race condition caught! Both players clicked simultaneously. Retry join!
-                        peer.destroy();
-                        setTimeout(() => attemptWebRTCConnection(targetRoomId, statusText, connectBtn), 500);
-                    } else {
-                        statusText.innerText = "Error: " + hostErr.type;
-                        statusText.classList.replace('text-green-400', 'text-red-400');
-                        connectBtn.disabled = false;
-                        connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                    }
-                });
-            }, 500);
-            
+            createHostRoom(targetRoomId, statusText, connectBtn);
         } else {
             statusText.innerText = "Network Error: " + err.type;
             statusText.classList.replace('text-yellow-400', 'text-red-400');
@@ -311,7 +325,7 @@ function launchGameUI() {
         badge.classList.add('bg-blue-600');
     }
     
-    // Safely check for global phaserGame
+    // SURGICAL FIX: Safely check for global phaserGame
     if (!phaserGame) startGame(); 
 }
 
@@ -355,7 +369,7 @@ function setupConnectionEvents(connection, statusText, connectBtn) {
     });
     
     connection.on('close', () => {
-        alert("The other player disconnected!");
+        alert("The other player disconnected from the timeline!");
         window.location.reload();
     });
 }
@@ -390,7 +404,7 @@ function applyPlayerPhysics(state, input) {
         let dashDx = dx;
         let dashDy = dy;
         
-        // If no direction is held during dash, dash towards the last saved facing direction
+        // BUGFIX: If no direction is held during dash, dash towards the last saved facing direction
         if (dashDx === 0 && dashDy === 0) {
             dashDx = nextState.lastDx;
             dashDy = nextState.lastDy;
