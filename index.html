@@ -16,16 +16,13 @@
 </head>
 <body>
 
-    <!-- Context Warning Banner -->
-    <div id="insecure-warning" class="hidden text-white text-center p-2 text-sm w-full absolute top-0 z-50"></div>
-
     <!-- UI Overlay for P2P Connection -->
     <div id="ui-layer">
         <h1 class="text-5xl font-bold mb-8 text-blue-400 tracking-wider">BULBADASH</h1>
         <p class="mb-8 text-gray-300">True Deterministic P2P Rollback (GGPO-Style)</p>
 
         <!-- Symmetric Matchmaking Panel -->
-        <div class="bg-gray-800 p-8 rounded-lg shadow-lg flex flex-col items-center w-96 border-t-4 border-purple-500">
+        <div class="bg-gray-800 p-8 rounded-lg shadow-lg flex flex-col items-center w-96 border-t-4 border-purple-500 relative">
             <h2 class="text-3xl font-semibold mb-2 text-purple-400">Matchmaking</h2>
             <p class="text-sm text-gray-400 mb-6 text-center">Enter a shared room password. The first to connect creates the room!</p>
             
@@ -64,7 +61,8 @@
  * GAME CONSTANTS & PHYSICS SETTINGS
  * ==========================================
  * Strict scalars to ensure deterministic simulation.
- * By decoupling from framerate, both peers run the exact same math.
+ * By decoupling from framerate, both peers run the exact same math,
+ * guaranteeing the simulations do not drift apart.
  */
 const GAME_WIDTH = 800;
 const GAME_HEIGHT = 600;
@@ -78,9 +76,8 @@ const MOVE_SPEED = 6;
 const DASH_SPEED = 18;
 const DASH_COOLDOWN_TICKS = 90; // 1.5 seconds at 60Hz
 const DASH_DURATION_TICKS = 10;
-const HISTORY_BUFFER_SIZE = 120; // 2 seconds of history for rollback
+const HISTORY_BUFFER_SIZE = 120; // 2 seconds of history to hold in memory for rollbacks
 
-// Tiered arena layout. Platforms spaced to be reachable by a standard jump.
 const PLATFORMS = [
     { x: 0,   y: 550, w: 800, h: 50 },  // Floor
     { x: 100, y: 440, w: 150, h: 20 },  // L1 Left
@@ -96,24 +93,26 @@ const PLATFORMS = [
  * TRUE P2P ROLLBACK VARIABLES
  * ==========================================
  */
-let isPlayerOne = false; // Decided dynamically during the handshake
+let isPlayerOne = false; // Decided dynamically during the symmetric handshake
 let peer = null;
 let conn = null;
 let bc = null; 
 
 let currentTick = 0; 
-let latestRemoteTick = 0; // Used to stall our loop if we run too far ahead of the other player
+let latestRemoteTick = 0; // Tracks the newest input received from the opponent
 
-// In True P2P, there is only one "Shared Reality" GameState.
+// In True P2P (GGPO), there is only one "Shared Reality" GameState.
+// We don't have separate Host/Client states, just one pure mathematical state.
 let gameState = {
     p1: createInitialState(100, 100, 1), // Starts facing right (1)
     p2: createInitialState(650, 100, -1) // Starts facing left (-1)
 };
 
-// The Time Machine History Arrays
-let stateHistory = []; // Stores complete snapshots of the game at every tick
-let inputHistory = []; // Stores the inputs both players pressed at every tick
-let localInputQueue = []; // Holds the last 10 frames of inputs to send in case of packet loss
+// --- THE TIME MACHINE (History Arrays) ---
+// To rollback time, we must save past states and past inputs.
+let stateHistory = []; // Stores complete snapshots of the game at every logical tick
+let inputHistory = []; // Stores the inputs both players pressed at every logical tick
+let localInputQueue = []; // Holds the last 10 frames of local inputs to send redundantly (prevents packet loss)
 
 // Initialize Tick 0 History Baseline
 stateHistory[0] = JSON.parse(JSON.stringify(gameState));
@@ -125,31 +124,33 @@ inputHistory[0] = {
 let keys = {};
 let prevJumpState = false;
 let prevDashState = false;
-
-// Variables to track kills and render visual feedback
 let renderP1Hits = 0;
 let renderP2Hits = 0;
 
-// Environment check for local testing bypass
-const isLocalMachine = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-const warningBanner = document.getElementById('insecure-warning');
-
-if (isLocalMachine) {
-    warningBanner.innerHTML = "<strong>Local Tab Mode Active:</strong> WebRTC bypassed for loopback testing. Use any shared password to play instantly. <em>(Note: Both tabs must be regular windows!)</em>";
-    warningBanner.classList.add('bg-blue-600');
-    warningBanner.classList.remove('hidden');
-} else if (window.location.protocol === 'http:') {
-    warningBanner.innerHTML = "<strong>Warning:</strong> HTTP LAN connections block WebRTC on Android/Mac. Please host via ngrok (HTTPS) for cross-device play.";
-    warningBanner.classList.add('bg-red-600');
-    warningBanner.classList.remove('hidden');
-}
-
+// Robust PeerJS config with Free TURN servers.
+// If standard P2P (STUN) fails due to NAT/Hairpinning, traffic is relayed securely through these servers.
 const peerConfig = {
     debug: 2,
     config: {
+        iceTransportPolicy: 'all',
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
+            { urls: 'stun:global.stun.twilio.com:3478' },
+            {
+                urls: "turn:openrelay.metered.ca:80",
+                username: "openrelayproject",
+                credential: "openrelayproject"
+            },
+            {
+                urls: "turn:openrelay.metered.ca:443",
+                username: "openrelayproject",
+                credential: "openrelayproject"
+            },
+            {
+                urls: "turn:openrelay.metered.ca:443?transport=tcp",
+                username: "openrelayproject",
+                credential: "openrelayproject"
+            }
         ]
     }
 };
@@ -170,124 +171,115 @@ function createInitialState(startX, startY, startFacingX) {
 
 /**
  * ==========================================
- * SYMMETRIC MATCHMAKING (WEBRTC + LOCAL BYPASS)
+ * SYMMETRIC MATCHMAKING (WEBRTC + CROSS-TAB)
  * ==========================================
+ * Allows both players to enter a common password. 
+ * The code automatically negotiates who acts as the P2P Host and who acts as the Client.
  */
 document.getElementById('btn-connect').addEventListener('click', () => {
     const rawPassword = document.getElementById('room-password').value.trim().toLowerCase();
-    if (!rawPassword) {
-        alert("Please enter a room password!");
-        return;
-    }
+    if (!rawPassword) { alert("Please enter a room password!"); return; }
     
-    // Prefix to prevent colliding with other random PeerJS users globally
-    const targetRoomId = 'bulbadash_ggpo_' + rawPassword;
-    
+    const targetRoomId = 'bulbadash_v2_' + rawPassword;
     const statusText = document.getElementById('matchmaking-status');
-    const iceDisplay = document.getElementById('ice-state-display');
     const connectBtn = document.getElementById('btn-connect');
     
     statusText.classList.remove('hidden');
-    statusText.innerText = "Searching for room...";
+    statusText.innerText = "Probing for local tabs...";
     statusText.className = "mt-6 text-sm text-yellow-400 font-mono text-center h-8";
     connectBtn.disabled = true;
     connectBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
-    // --- LOCAL SAME-MACHINE BYPASS (SYMMETRIC NEGOTIATION) ---
-    if (isLocalMachine) {
-        bc = new BroadcastChannel('bulbadash_local_room');
-        let foundHost = false;
+    // 1. Cross-Tab Local Bypass
+    // Instantly routes traffic through browser memory if testing locally on 2 tabs
+    bc = new BroadcastChannel('bulbadash_local_' + targetRoomId);
+    let localTabFound = false;
         
         bc.onmessage = (e) => {
-            if (e.data.room !== targetRoomId) return; // Ignore traffic from other local test rooms
-            
-            if (e.data.type === 'probe' && isPlayerOne) {
-                // We are already hosting this room, tell them we are here!
-                bc.postMessage({ type: 'probe_ack', room: targetRoomId });
-            } else if (e.data.type === 'probe_ack' && !isPlayerOne) {
-                // We found a host! We are Player 2.
-                foundHost = true;
-                statusText.innerText = "Room found! Joining as Player 2...";
-                statusText.classList.replace('text-yellow-400', 'text-green-400');
-                bc.postMessage({ type: 'join_req', room: targetRoomId });
+        if (e.data.type === 'probe') {
+            if (isPlayerOne && window.phaserGame) bc.postMessage({ type: 'probe_ack' });
+        } else if (e.data.type === 'probe_ack') {
+            localTabFound = true;
+            isPlayerOne = false; // We found a host, so we are P2
+            statusText.innerText = "Local tab found! Joining...";
+            bc.postMessage({ type: 'join_req' });
             } else if (e.data.type === 'join_req' && isPlayerOne) {
-                // The client is officially joining our room.
-                bc.postMessage({ type: 'join_ack', room: targetRoomId });
-                statusText.innerText = "Player 2 joined! Starting...";
-                conn = { open: true, send: (d) => bc.postMessage({room: targetRoomId, ...d}) };
+            bc.postMessage({ type: 'join_ack' });
+            statusText.innerText = "Local Player 2 joined!";
+            conn = { open: true, send: (d) => bc.postMessage(d) }; // Mock network connection
                 launchGameUI();
             } else if (e.data.type === 'join_ack' && !isPlayerOne) {
-                // Host acknowledged us. Start the game!
-                statusText.innerText = "Joined! Starting...";
-                conn = { open: true, send: (d) => bc.postMessage({room: targetRoomId, ...d}) };
+            statusText.innerText = "Joined local host!";
+            conn = { open: true, send: (d) => bc.postMessage(d) }; // Mock network connection
                 launchGameUI();
             } else if (e.data.type === 'inputs') {
-                handleNetworkData(e.data);
+            handleNetworkData(e.data); // Route data to the netcode engine
             }
         };
         
-        // Ping the local network to see if Player 1 is already waiting
-        bc.postMessage({ type: 'probe', room: targetRoomId });
+    bc.postMessage({ type: 'probe' });
         
-        // If nobody answers our ping in 300ms, assume the room is empty and BECOME Player 1
+    // 2. If no local tabs answer within 400ms, initiate robust WebRTC Handshake
         setTimeout(() => {
-            if (!foundHost && !isPlayerOne) {
-                isPlayerOne = true;
-                statusText.innerText = "Room created! Waiting for Player 2...";
-                statusText.classList.replace('text-yellow-400', 'text-green-400');
+        if (!localTabFound) {
+            statusText.innerText = "Checking global network (WebRTC)...";
+            attemptWebRTCConnection(targetRoomId, statusText, connectBtn);
             }
-        }, 300);
-        
-        return;
-    }
+    }, 400);
+});
 
-    // --- NORMAL WEBRTC (SYMMETRIC NEGOTIATION) ---
-    // First, we create a temporary random peer to try and connect to the room password
+function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
+    if (peer) peer.destroy();
+    
     peer = new Peer(peerConfig);
     
     peer.on('open', () => {
         statusText.innerText = "Checking if room exists...";
         
-        // Attempt to join the room
+        // Attempt to join the room password as a Client
         conn = peer.connect(targetRoomId);
         
         conn.on('open', () => {
-            // SUCCESS! Someone was already hosting this password. We are Player 2.
             isPlayerOne = false;
             statusText.innerText = "Room found! Joining as Player 2...";
             statusText.classList.replace('text-yellow-400', 'text-green-400');
-            setupConnectionEvents(conn);
+            setupConnectionEvents(conn, statusText, connectBtn);
         });
     });
 
     peer.on('error', (err) => {
         if (err.type === 'peer-unavailable') {
-            // THE ROOM DOES NOT EXIST YET!
-            // We must destroy our temp peer and BECOME the host using the password as our ID.
+            // Room does not exist. We destroy our temp peer and become the Host.
             peer.destroy();
-            
             statusText.innerText = "Creating room... Waiting for Player 2.";
             statusText.classList.replace('text-yellow-400', 'text-green-400');
             isPlayerOne = true;
             
             setTimeout(() => {
+                // Reinitialize using the password as our actual PeerJS ID
                 peer = new Peer(targetRoomId, peerConfig);
                 
                 peer.on('open', () => {
                     peer.on('connection', (incomingConnection) => {
-                        statusText.innerText = "Player 2 joined! Negotiating DataChannel...";
+                        statusText.innerText = "Player 2 joined! Negotiating connection...";
                         conn = incomingConnection;
-                        setupConnectionEvents(conn);
+                        setupConnectionEvents(conn, statusText, connectBtn);
                     });
                 });
                 
                 peer.on('error', (hostErr) => {
-                    statusText.innerText = "Error creating room: " + hostErr.type;
+                    if (hostErr.type === 'unavailable-id') {
+                        // Race condition caught! Both players clicked simultaneously. Retry join!
+                        peer.destroy();
+                        setTimeout(() => attemptWebRTCConnection(targetRoomId, statusText, connectBtn), 500);
+                    } else {
+                        statusText.innerText = "Error: " + hostErr.type;
                     statusText.classList.replace('text-green-400', 'text-red-400');
                     connectBtn.disabled = false;
                     connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    }
                 });
-            }, 500); // Tiny delay ensures the temp peer is fully cleaned up before re-binding
+            }, 500);
             
         } else {
             statusText.innerText = "Network Error: " + err.type;
@@ -296,7 +288,7 @@ document.getElementById('btn-connect').addEventListener('click', () => {
             connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
         }
     });
-});
+}
 
 function launchGameUI() {
     if (document.getElementById('ui-layer').classList.contains('hidden')) return;
@@ -312,10 +304,10 @@ function launchGameUI() {
         badge.classList.add('bg-blue-600');
     }
     
-    if (!phaserGame) startGame(); 
+    if (!window.phaserGame) startGame(); 
 }
 
-function setupConnectionEvents(connection) {
+function setupConnectionEvents(connection, statusText, connectBtn) {
     const iceDisplay = document.getElementById('ice-state-display');
     iceDisplay.classList.remove('hidden');
 
@@ -323,6 +315,19 @@ function setupConnectionEvents(connection) {
         if (connection.peerConnection) {
             const state = connection.peerConnection.iceConnectionState;
             iceDisplay.innerText = `ICE State: ${state}`;
+            
+            if (state === 'failed' || state === 'disconnected') {
+                iceDisplay.classList.add('text-red-400');
+                if (state === 'failed') {
+                    clearInterval(diagInterval);
+                    statusText.innerText = "Connection blocked by router (NAT). Try another network.";
+                    statusText.classList.replace('text-green-400', 'text-red-400');
+                    connectBtn.disabled = false;
+                    connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                }
+            } else {
+                iceDisplay.classList.remove('text-red-400');
+            }
         }
     }, 500);
 
@@ -339,6 +344,11 @@ function setupConnectionEvents(connection) {
             handleNetworkData(data);
         }
     });
+    
+    connection.on('close', () => {
+        alert("The other player disconnected!");
+        window.location.reload();
+    });
 }
 
 /**
@@ -346,6 +356,7 @@ function setupConnectionEvents(connection) {
  * SYMMETRICAL PURE PHYSICS ENGINE
  * ==========================================
  * This pure function applies movement/gravity to ONE character based on their inputs.
+ * It is deterministic, meaning giving it State A and Input B will ALWAYS produce State C.
  */
 function applyPlayerPhysics(state, input) {
     let nextState = { ...state };
@@ -370,7 +381,7 @@ function applyPlayerPhysics(state, input) {
         let dashDx = dx;
         let dashDy = dy;
         
-        // BUGFIX: If no direction is held during dash, dash towards the last saved facing direction
+        // If no direction is held during dash, dash towards the last saved facing direction
         if (dashDx === 0 && dashDy === 0) {
             dashDx = nextState.lastDx;
             dashDy = nextState.lastDy;
@@ -415,7 +426,6 @@ function applyPlayerPhysics(state, input) {
     if (nextState.x > GAME_WIDTH - PLAYER_SIZE) nextState.x = GAME_WIDTH - PLAYER_SIZE;
     if (nextState.y < 0) nextState.y = 0;
     
-    // Death barrier respawn
     if (nextState.y > GAME_HEIGHT) {
         nextState.x = 400; nextState.y = 100; nextState.vy = 0;
     }
@@ -428,6 +438,8 @@ function checkAABB(x1, y1, w1, h1, x2, y2, w2, h2) {
 
 /**
  * The Master Engine: Processes both players and handles symmetrical collisions.
+ * In True P2P, there is no "Host Combat check". If they hit each other on the 
+ * exact same simulated logical tick, they BOTH die identically on both computers.
  */
 function stepPhysics(prevState, in1, in2) {
     let p1 = applyPlayerPhysics(prevState.p1, in1);
@@ -448,47 +460,46 @@ function stepPhysics(prevState, in1, in2) {
  * ==========================================
  * THE TIME MACHINE (ROLLBACK NETCODE)
  * ==========================================
+ * Handles processing incoming opponent packets, detecting "Reality Fractures",
+ * and rewinding the simulation to correct history.
  */
 function handleNetworkData(payload) {
     let earliestMismatch = -1;
     
-    // We receive an array of the remote player's last 10 inputs to protect against dropped packets
+    // We receive an array of the opponent's last 10 inputs to protect against dropped UDP packets
     for (let packet of payload.data) {
         const rTick = packet.tick;
         const rInput = packet.input;
         
         if (rTick > latestRemoteTick) latestRemoteTick = rTick;
-
-        // Ignore inputs that are incredibly old
-        if (rTick <= currentTick - HISTORY_BUFFER_SIZE) continue;
-
+        // Ignore inputs that are incredibly old        if (rTick <= currentTick - HISTORY_BUFFER_SIZE) continue; // Ignore ancient packets
         if (!inputHistory[rTick]) inputHistory[rTick] = { p1: null, p2: null };
         
-        // Grab what we PREDICTED the other player was doing on this tick
+        // Grab what we PREDICTED the opponent was doing on this specific tick in the past
         let predictedInput = isPlayerOne ? inputHistory[rTick].p2 : inputHistory[rTick].p1;
         let isNewOrMismatch = false;
 
-        // If we predicted it, check if our prediction was wrong!
+        // Compare our prediction against the True Input that just arrived in the packet
         if (!predictedInput || predictedInput.isPredicted) {
              if (!predictedInput) {
                  isNewOrMismatch = true;
              } else {
                  for (let key in rInput) {
                      if (rInput[key] !== predictedInput[key]) {
-                         isNewOrMismatch = true; break;
+                         isNewOrMismatch = true; break; // Reality Fracture detected!
                      }
                  }
              }
         }
 
-        // Save the Absolute Truth to history
+        // Save the Absolute Truth to the history array
         if (isPlayerOne) inputHistory[rTick].p2 = rInput;
         else inputHistory[rTick].p1 = rInput;
 
-        // Trigger a rollback if the packet belongs to our past/present AND our prediction was wrong
+        // If the packet belongs to our past/present AND our prediction was wrong, schedule a Rollback
         if (rTick <= currentTick && isNewOrMismatch) {
             if (earliestMismatch === -1 || rTick < earliestMismatch) {
-                earliestMismatch = rTick;
+                earliestMismatch = rTick; // Find the OLDEST broken frame to rewind to
             }
         }
     }
@@ -500,15 +511,15 @@ function handleNetworkData(payload) {
 }
 
 function executeRollback(startTick) {
-    // 1. Teleport logical state back to the moment before the prediction failed
+    // 1. Teleport the game's logical state back to the moment before the prediction failed
     let rbState = stateHistory[startTick - 1];
     if (!rbState) return; 
 
     // 2. Fast forward time back to the present moment (currentTick)
     for (let i = startTick; i <= currentTick; i++) {
         
-        // If we are still missing the remote player's input for a frame in the fast-forward,
-        // we must guess what they did based on the NEW corrected history.
+        // If we are still missing the opponent's input for a frame in the fast-forward loop,
+        // we must guess what they did based on the newly corrected history.
         let remoteInput = isPlayerOne ? inputHistory[i].p2 : inputHistory[i].p1;
         if (!remoteInput || remoteInput.isPredicted) {
             const prevRemote = isPlayerOne ? inputHistory[i-1].p2 : inputHistory[i-1].p1;
@@ -525,7 +536,7 @@ function executeRollback(startTick) {
         // Re-simulate physics applying the newly confirmed true inputs
         rbState = stepPhysics(rbState, inputHistory[i].p1, inputHistory[i].p2);
         
-        // Overwrite the fake history with the real history
+        // Overwrite the fake history with the newly simulated real history
         stateHistory[i] = JSON.parse(JSON.stringify(rbState));
     }
     
@@ -542,8 +553,8 @@ function executeRollback(startTick) {
  */
 function tick() {
     // TICK CONTROLLER: Ensure neither player runs too far ahead.
-    // If we simulate more than 15 frames into the future without hearing from the remote player,
-    // we stall our game loop. This keeps both players perfectly synced!
+    // If we simulate more than 15 frames into the future without hearing from the opponent,
+    // we deliberately stall our game loop. This prevents massive rollbacks and keeps players synced.
     if (conn && conn.open && currentTick - latestRemoteTick > 15) {
         return; 
     }
@@ -551,6 +562,7 @@ function tick() {
     currentTick++;
 
     // Process Input (Keyboard + Improved Controller Mapping)
+    
     let padState = { left: false, right: false, up: false, down: false, dash: false, jump: false };
     if (phaserGame && phaserGame.input.gamepad && phaserGame.input.gamepad.total > 0) {
         let pad = phaserGame.input.gamepad.getPad(0);
@@ -562,11 +574,11 @@ function tick() {
         padState.up = pad.up || axisV < -0.5;
         padState.down = pad.down || axisV > 0.5;
         
-        padState.jump = pad.A; // 'A' (bottom face button) to Jump
-        padState.dash = pad.X || pad.B || pad.Y; // 'X' or 'B' to dash
+        padState.jump = pad.A; 
+        padState.dash = pad.X || pad.B || pad.Y; 
     }
 
-    let isJumpPressed = keys.up.isDown || padState.jump; // Up arrow still works for keyboard jump
+    let isJumpPressed = keys.up.isDown || padState.jump; 
     let isDashPressed = keys.dash.isDown || padState.dash;
 
     let jumpJustPressed = isJumpPressed && !prevJumpState;
@@ -575,36 +587,37 @@ function tick() {
     prevJumpState = isJumpPressed;
     prevDashState = isDashPressed;
 
+    // Gather Local Input
     const localInput = {
         left: keys.left.isDown || padState.left,
         right: keys.right.isDown || padState.right,
-        up: keys.up.isDown || padState.up, // Used for aiming the dash upwards
+        up: keys.up.isDown || padState.up, 
         down: keys.down.isDown || padState.down,
         jump: jumpJustPressed, 
         dash: dashJustPressed,
-        isPredicted: false // This is absolute truth
+        isPredicted: false // This is absolute truth (our own input)
     };
 
-    // Save local input to history
     if (!inputHistory[currentTick]) inputHistory[currentTick] = { p1: null, p2: null };
     
+    // Save local input to the correct history array slot
     if (isPlayerOne) inputHistory[currentTick].p1 = localInput;
     else inputHistory[currentTick].p2 = localInput;
 
-    // Send local input across the network immediately (with redundancy for packet loss)
+    // Send local input across the network immediately (with a 10-frame redundancy buffer for packet loss)
     if (conn && conn.open) {
         localInputQueue.push({ tick: currentTick, input: localInput });
-        if (localInputQueue.length > 10) localInputQueue.shift(); // Keep only last 10
+        if (localInputQueue.length > 10) localInputQueue.shift(); 
         conn.send({ type: 'inputs', data: localInputQueue });
     }
 
-    // PREDICT the remote player's input since it hasn't arrived over the internet yet.
+    // PREDICT the opponent's input since it hasn't arrived over the internet yet.
     // We assume they just keep holding the same directional buttons they held last frame.
     const prevRemoteInput = isPlayerOne ? inputHistory[currentTick - 1].p2 : inputHistory[currentTick - 1].p1;
     let predictedRemoteInput = { 
         left: prevRemoteInput ? prevRemoteInput.left : false, 
         right: prevRemoteInput ? prevRemoteInput.right : false,
-        up: false, down: false, jump: false, dash: false,
+        up: false, down: false, jump: false, dash: false, // Jumps/dashes are unpredictable, default to false
         isPredicted: true 
     };
 
@@ -615,7 +628,7 @@ function tick() {
     gameState = stepPhysics(gameState, inputHistory[currentTick].p1, inputHistory[currentTick].p2);
     stateHistory[currentTick] = JSON.parse(JSON.stringify(gameState));
     
-    // Memory cleanup: Forget history older than 2 seconds
+    // Memory cleanup: Forget history older than 2 seconds to prevent memory leaks
     if (currentTick > HISTORY_BUFFER_SIZE) {
         delete stateHistory[currentTick - HISTORY_BUFFER_SIZE];
         delete inputHistory[currentTick - HISTORY_BUFFER_SIZE];
@@ -635,12 +648,12 @@ function updateScores(p1Hits, p2Hits) {
  * PHASER 3 RENDERING & INTEGRATION
  * ==========================================
  */
-let phaserGame;
 let spriteP1;
 let spriteP2;
 let dashIndicators = {};
 
 function startGame() {
+    window.gameIsActive = true;
     const config = {
         type: Phaser.AUTO,
         width: GAME_WIDTH,
@@ -650,7 +663,7 @@ function startGame() {
         input: { gamepad: true },
         scene: { preload: preload, create: create, update: update }
     };
-    phaserGame = new Phaser.Game(config);
+    window.phaserGame = new Phaser.Game(config);
 }
 
 function preload() {}
@@ -683,7 +696,7 @@ function create() {
 
 let accumulator = 0;
 
-// Helper to create an elegant geometric spark burst for visual impact
+// Helper to create an elegant geometric spark burst for visual impact upon a kill
 function createSparkBurst(scene, x, y, colorHex) {
     for (let i = 0; i < 20; i++) {
         // Create tiny colored rectangles to represent physical sparks
@@ -712,7 +725,7 @@ function createSparkBurst(scene, x, y, colorHex) {
 // Visual Detachment: Interpolate rendering to hide Rollback stutters
 function smoothSnap(sprite, targetState) {
     if (Math.abs(sprite.x - targetState.x) > 100 || Math.abs(sprite.y - targetState.y) > 100) {
-        sprite.x = targetState.x; sprite.y = targetState.y; // Instant snap for respawns
+        sprite.x = targetState.x; sprite.y = targetState.y; // Snap immediately if respawning
     } else {
         sprite.x = Phaser.Math.Linear(sprite.x, targetState.x, 0.4);
         sprite.y = Phaser.Math.Linear(sprite.y, targetState.y, 0.4);
@@ -721,6 +734,7 @@ function smoothSnap(sprite, targetState) {
 
 function update(time, delta) {
     accumulator += delta;
+    // Consume accumulator in fixed TICK_MS chunks to separate framerate from game logic
     while (accumulator >= TICK_MS) {
         tick(); 
         accumulator -= TICK_MS;
