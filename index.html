@@ -386,10 +386,42 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
 }
 
 function setupTouchControls() {
-    // Only show on touch devices
+    // 1. Initial barrier: Only run on devices that actually have touch screens
     if (!('ontouchstart' in window) && navigator.maxTouchPoints === 0) return;
-    document.getElementById('touch-controls').classList.remove('hidden');
+    
+    const touchUI = document.getElementById('touch-controls');
 
+    // 2. Check if a physical gamepad is ALREADY registered 
+    // (Android built-in controllers often register immediately on load)
+    let hasGamepad = false;
+    if (navigator.getGamepads) {
+        let pads = navigator.getGamepads();
+        for (let i = 0; i < pads.length; i++) {
+            if (pads[i]) hasGamepad = true;
+        }
+    }
+    
+    // Only show the touch UI if no hardware controller is detected
+    if (!hasGamepad) {
+        touchUI.classList.remove('hidden');
+    }
+
+    // 3. Dynamically hide the touch UI the exact millisecond a physical button is pressed
+    window.addEventListener("gamepadconnected", () => {
+        touchUI.classList.add('hidden');
+    });
+
+    // 4. Bring the touch UI back as a fallback if the controller disconnects
+    window.addEventListener("gamepaddisconnected", () => {
+        let activePads = false;
+        let pads = navigator.getGamepads();
+        for (let i = 0; i < pads.length; i++) {
+            if (pads[i]) activePads = true;
+        }
+        if (!activePads) touchUI.classList.remove('hidden');
+    });
+
+    // 5. Bind the touch events (we bind them regardless, so they are ready if needed)
     const bindBtn = (id, key) => {
         const el = document.getElementById(id);
         if (!el) return;
@@ -397,6 +429,7 @@ function setupTouchControls() {
         el.addEventListener('touchend', (e) => { e.preventDefault(); window.touchState[key] = false; }, {passive: false});
         el.addEventListener('touchcancel', (e) => { e.preventDefault(); window.touchState[key] = false; }, {passive: false});
     };
+    
     bindBtn('btn-up', 'up'); bindBtn('btn-down', 'down');
     bindBtn('btn-left', 'left'); bindBtn('btn-right', 'right');
     bindBtn('btn-jump', 'jump'); bindBtn('btn-dash', 'dash');
