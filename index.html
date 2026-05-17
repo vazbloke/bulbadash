@@ -157,8 +157,21 @@ inputHistory[0] = {
 };
 
 let keys = {};
-let prevJumpState = false;
-let prevDashState = false;
+let isLocalMultiplayer = false;
+
+// SURGICAL FIX: Track Left and Right Shift distinctly, bypassing Phaser's generic SHIFT
+window.keyState = { lShift: false, rShift: false };
+window.addEventListener('keydown', e => {
+    if (e.code === 'ShiftLeft') window.keyState.lShift = true;
+    if (e.code === 'ShiftRight') window.keyState.rShift = true;
+});
+window.addEventListener('keyup', e => {
+    if (e.code === 'ShiftLeft') window.keyState.lShift = false;
+    if (e.code === 'ShiftRight') window.keyState.rShift = false;
+});
+
+let prevP1Jump = false; let prevP1Dash = false;
+let prevP2Jump = false; let prevP2Dash = false;
 let renderP1Hits = 0;
 let renderP2Hits = 0;
 
@@ -208,9 +221,10 @@ function getDynamicPeerConfig() {
     };
 }
 
-// SURGICAL FIX: Solo Playground Logic
+// SURGICAL FIX: Solo Playground converts to Couch Co-Op
 document.getElementById('btn-solo').addEventListener('click', () => {
-    isPlayerOne = true; // We are our own Host
+    isLocalMultiplayer = true;
+    isPlayerOne = true; // Assign UI anchor to P1
     conn = null;        // Bypass network requirements completely
     launchGameUI();     // Instantly load the physics engine
 });
@@ -441,7 +455,10 @@ function launchGameUI() {
     document.getElementById('game-container').classList.remove('hidden');
     
     const badge = document.getElementById('role-badge');
-    if (isPlayerOne) {
+    if (isLocalMultiplayer) {
+        document.getElementById('role-name').innerText = "LOCAL VS";
+        badge.classList.add('bg-purple-600');
+    } else if (isPlayerOne) {
         document.getElementById('role-name').innerText = "PLAYER 1";
         badge.classList.add('bg-green-600');
     } else {
@@ -450,7 +467,6 @@ function launchGameUI() {
     }
     
     setupTouchControls();
-    // SURGICAL FIX: Safely check for global phaserGame
     if (!phaserGame) startGame(); 
 }
 
@@ -720,128 +736,132 @@ function executeRollback(startTick) {
     updateScores(gameState.p1.hits, gameState.p2.hits);
 }
 
-
 /**
  * ==========================================
  * MAIN FIXED-TIMESTEP GAME LOOP
  * ==========================================
  */
 function tick() {
-    // TICK CONTROLLER: Ensure neither player runs too far ahead.
-    // If we simulate more than 15 frames into the future without hearing from the opponent,
-    // we deliberately stall our game loop. This prevents massive rollbacks and keeps players synced.
-    
     if (conn && conn.open && currentTick - latestRemoteTick > 15) {
         return; 
     }
     
     currentTick++;
 
-    let padState = { left: false, right: false, up: false, down: false };
-    let isJumpPressed = false;
-    let isDashPressed = false;
+    let p1Raw = { left: false, right: false, up: false, down: false, jump: false, dash: false, isPredicted: false };
+    let p2Raw = { left: false, right: false, up: false, down: false, jump: false, dash: false, isPredicted: false };
 
-    // 1. Check Keyboard & Touch Inputs Safely
-    if ((keys.left && keys.left.isDown) || window.touchState.left) padState.left = true;
-    if ((keys.right && keys.right.isDown) || window.touchState.right) padState.right = true;
-    if ((keys.up && keys.up.isDown) || window.touchState.up) padState.up = true;
-    if ((keys.down && keys.down.isDown) || window.touchState.down) padState.down = true;
-    
-    if ((keys.up && keys.up.isDown) || window.touchState.jump) isJumpPressed = true;
-    if ((keys.dash && keys.dash.isDown) || window.touchState.dash) isDashPressed = true;
+    // Player 1 (Arrow Keys + Right Shift / Touch Controls)
+    if (keys.left.isDown || window.touchState.left) p1Raw.left = true;
+    if (keys.right.isDown || window.touchState.right) p1Raw.right = true;
+    if (keys.up.isDown || window.touchState.up) p1Raw.up = true;
+    if (keys.down.isDown || window.touchState.down) p1Raw.down = true;
+    if (keys.up.isDown || window.touchState.jump) p1Raw.jump = true;
+    if (window.keyState.rShift || window.touchState.dash) p1Raw.dash = true;
 
-    // 2. Check Native HTML5 Gamepad API (Bypasses Phaser's delayed Android Handheld detection)
+    // Player 2 (WASD + Left Shift)
+    if (keys.a.isDown) p2Raw.left = true;
+    if (keys.d.isDown) p2Raw.right = true;
+    if (keys.w.isDown) p2Raw.up = true;
+    if (keys.s.isDown) p2Raw.down = true;
+    if (keys.w.isDown) p2Raw.jump = true;
+    if (window.keyState.lShift) p2Raw.dash = true;
+
+    // Gamepad Override (Assigns to P1 for now)
     if (navigator.getGamepads) {
         let pads = navigator.getGamepads();
         for (let i = 0; i < pads.length; i++) {
             let pad = pads[i];
             if (pad) {
-                // Joysticks
                 let axisH = pad.axes.length > 0 ? pad.axes[0] : 0;
                 let axisV = pad.axes.length > 1 ? pad.axes[1] : 0;
-                if (axisH < -0.4) padState.left = true;
-                if (axisH > 0.4) padState.right = true;
-                if (axisV < -0.4) padState.up = true;
-                if (axisV > 0.4) padState.down = true;
+                
+                let padLeft = axisH < -0.4 || (pad.buttons[14] && pad.buttons[14].pressed);
+                let padRight = axisH > 0.4 || (pad.buttons[15] && pad.buttons[15].pressed);
+                let padUp = axisV < -0.4 || (pad.buttons[12] && pad.buttons[12].pressed);
+                let padDown = axisV > 0.4 || (pad.buttons[13] && pad.buttons[13].pressed);
+                let padJump = pad.buttons[0] && pad.buttons[0].pressed;
+                let padDash = (pad.buttons[1] && pad.buttons[1].pressed) || (pad.buttons[2] && pad.buttons[2].pressed) || (pad.buttons[3] && pad.buttons[3].pressed);
 
-                // Physical D-PAD (Buttons 12-15 on Android Gamepads)
-                if (pad.buttons[14] && pad.buttons[14].pressed) padState.left = true;
-                if (pad.buttons[15] && pad.buttons[15].pressed) padState.right = true;
-                if (pad.buttons[12] && pad.buttons[12].pressed) padState.up = true;
-                if (pad.buttons[13] && pad.buttons[13].pressed) padState.down = true;
-
-                // Face Buttons (A to Jump, B/X/Y to Dash)
-                if (pad.buttons[0] && pad.buttons[0].pressed) isJumpPressed = true;
-                if ((pad.buttons[1] && pad.buttons[1].pressed) || 
-                    (pad.buttons[2] && pad.buttons[2].pressed) || 
-                    (pad.buttons[3] && pad.buttons[3].pressed)) {
-                    isDashPressed = true;
-                }
-                break; // Only read from the first active controller found
+                p1Raw.left = p1Raw.left || padLeft;
+                p1Raw.right = p1Raw.right || padRight;
+                p1Raw.up = p1Raw.up || padUp;
+                p1Raw.down = p1Raw.down || padDown;
+                p1Raw.jump = p1Raw.jump || padJump;
+                p1Raw.dash = p1Raw.dash || padDash;
+                break;
             }
         }
     }
 
-    let jumpJustPressed = isJumpPressed && !prevJumpState;
-    let dashJustPressed = isDashPressed && !prevDashState;
+    // Apply "Just-Pressed" logic separately for both players
+    let p1JumpJustPressed = p1Raw.jump && !prevP1Jump;
+    let p1DashJustPressed = p1Raw.dash && !prevP1Dash;
+    prevP1Jump = p1Raw.jump; prevP1Dash = p1Raw.dash;
 
-    prevJumpState = isJumpPressed;
-    prevDashState = isDashPressed;
+    let p2JumpJustPressed = p2Raw.jump && !prevP2Jump;
+    let p2DashJustPressed = p2Raw.dash && !prevP2Dash;
+    prevP2Jump = p2Raw.jump; prevP2Dash = p2Raw.dash;
 
-    // Gather Local Input from Hardware
-    const hardwareInput = {
-        left: padState.left, right: padState.right,
-        up: padState.up, down: padState.down,
-        jump: jumpJustPressed, dash: dashJustPressed,
-        isPredicted: false 
-    };
+    p1Raw.jump = p1JumpJustPressed; p1Raw.dash = p1DashJustPressed;
+    p2Raw.jump = p2JumpJustPressed; p2Raw.dash = p2DashJustPressed;
 
-    // SURGICAL FIX: Local Input Delay
-    // We sample hardware now, but schedule it to execute 'N' frames in the future.
     let targetTick = currentTick + LOCAL_INPUT_DELAY;
-    
     if (!inputHistory[currentTick]) inputHistory[currentTick] = { p1: null, p2: null };
     if (!inputHistory[targetTick]) inputHistory[targetTick] = { p1: null, p2: null };
 
-    // Save hardware input to the FUTURE tick
-    if (isPlayerOne) inputHistory[targetTick].p1 = hardwareInput;
-    else inputHistory[targetTick].p2 = hardwareInput;
+    if (isLocalMultiplayer) {
+        // LOCAL VS MODE: Feed both raw keyboards directly into the buffer
+        inputHistory[targetTick].p1 = p1Raw;
+        inputHistory[targetTick].p2 = p2Raw;
+        
+        let emptyPad = { left: false, right: false, up: false, down: false, jump: false, dash: false, isPredicted: false };
+        if (!inputHistory[currentTick].p1) inputHistory[currentTick].p1 = { ...emptyPad };
+        if (!inputHistory[currentTick].p2) inputHistory[currentTick].p2 = { ...emptyPad };
+        
+    } else {
+        // ONLINE MODE: Combine WASD and Arrows into one unified controller so you can use either!
+        let combinedPad = {
+            left: p1Raw.left || p2Raw.left,
+            right: p1Raw.right || p2Raw.right,
+            up: p1Raw.up || p2Raw.up,
+            down: p1Raw.down || p2Raw.down,
+            jump: p1Raw.jump || p2Raw.jump,
+            dash: p1Raw.dash || p2Raw.dash,
+            isPredicted: false
+        };
 
-    // Send immediately over the network (tagged with the future tick)
-    if (conn && conn.open) {
-        localInputQueue.push({ tick: targetTick, input: hardwareInput });
-        if (localInputQueue.length > 10) localInputQueue.shift(); 
-        conn.send({ type: 'inputs', data: localInputQueue });
+        if (isPlayerOne) inputHistory[targetTick].p1 = combinedPad;
+        else inputHistory[targetTick].p2 = combinedPad;
+
+        if (conn && conn.open) {
+            localInputQueue.push({ tick: targetTick, input: combinedPad });
+            if (localInputQueue.length > 10) localInputQueue.shift(); 
+            conn.send({ type: 'inputs', data: localInputQueue });
+        }
+
+        // Online Missing Input Injection
+        let emptyPad = { left: false, right: false, up: false, down: false, jump: false, dash: false, isPredicted: false };
+        if (isPlayerOne && !inputHistory[currentTick].p1) inputHistory[currentTick].p1 = { ...emptyPad };
+        if (!isPlayerOne && !inputHistory[currentTick].p2) inputHistory[currentTick].p2 = { ...emptyPad };
+
+        // PREDICT the remote opponent's input if it hasn't arrived
+        const prevRemoteInput = isPlayerOne ? inputHistory[currentTick - 1]?.p2 : inputHistory[currentTick - 1]?.p1;
+        let predictedRemoteInput = { 
+            left: prevRemoteInput ? prevRemoteInput.left : false, 
+            right: prevRemoteInput ? prevRemoteInput.right : false,
+            up: false, down: false, jump: false, dash: false, 
+            isPredicted: true 
+        };
+
+        if (isPlayerOne && !inputHistory[currentTick].p2) inputHistory[currentTick].p2 = predictedRemoteInput;
+        if (!isPlayerOne && !inputHistory[currentTick].p1) inputHistory[currentTick].p1 = predictedRemoteInput;
     }
 
-    // Retrieve what was scheduled to execute for the CURRENT tick
-    let currentLocalInput = isPlayerOne ? inputHistory[currentTick].p1 : inputHistory[currentTick].p2;
-    
-    // If the game just booted, the buffer is empty, so we inject empty inputs
-    if (!currentLocalInput) {
-        currentLocalInput = { left: false, right: false, up: false, down: false, jump: false, dash: false, isPredicted: false };
-        if (isPlayerOne) inputHistory[currentTick].p1 = currentLocalInput;
-        else inputHistory[currentTick].p2 = currentLocalInput;
-    }
-
-    // PREDICT the opponent's input since it hasn't arrived over the internet yet.
-    // We assume they just keep holding the same directional buttons they held last frame.
-    const prevRemoteInput = isPlayerOne ? inputHistory[currentTick - 1]?.p2 : inputHistory[currentTick - 1]?.p1;
-    let predictedRemoteInput = { 
-        left: prevRemoteInput ? prevRemoteInput.left : false, 
-        right: prevRemoteInput ? prevRemoteInput.right : false,
-        up: false, down: false, jump: false, dash: false, // Jumps/dashes are unpredictable, default to false
-        isPredicted: true 
-    };
-
-    if (isPlayerOne && !inputHistory[currentTick].p2) inputHistory[currentTick].p2 = predictedRemoteInput;
-    if (!isPlayerOne && !inputHistory[currentTick].p1) inputHistory[currentTick].p1 = predictedRemoteInput;
-
-    // Run the shared physics engine and save the reality to history
+    // Run physics and commit to memory
     gameState = stepPhysics(gameState, inputHistory[currentTick].p1, inputHistory[currentTick].p2);
     stateHistory[currentTick] = JSON.parse(JSON.stringify(gameState));
     
-    // Memory cleanup: Forget history older than the buffer to prevent memory leaks
     if (currentTick > HISTORY_BUFFER_SIZE) {
         delete stateHistory[currentTick - HISTORY_BUFFER_SIZE];
         delete inputHistory[currentTick - HISTORY_BUFFER_SIZE];
@@ -849,6 +869,7 @@ function tick() {
     
     updateScores(gameState.p1.hits, gameState.p2.hits);
 }
+
 function updateScores(p1Hits, p2Hits) {
     document.getElementById('score-p1').innerText = p1Hits;
     document.getElementById('score-p2').innerText = p2Hits;
@@ -933,7 +954,10 @@ function create() {
         down: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.DOWN),
         left: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.LEFT),
         right: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.RIGHT),
-        dash: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT)
+        w: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W),
+        s: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S),
+        a: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A),
+        d: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D)
     };
 
     // Initialize the Network Debug Block graphics layer
