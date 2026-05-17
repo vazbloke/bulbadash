@@ -328,8 +328,13 @@ document.getElementById('btn-connect').addEventListener('click', () => {
 // SURGICAL FIX: Removed custom flaky TURN servers. 
 // PeerJS will now default to its own highly reliable cloud infrastructure.
 
+let dataChannelTimeout = null; // SURGICAL FIX: Moved out of local scope so we can kill it
+
 function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
     if (peer) peer.destroy();
+    
+    // Clear any lingering ghost timeouts from previous button clicks
+    if (dataChannelTimeout) clearTimeout(dataChannelTimeout); 
     
     const config = getDynamicPeerConfig(); 
     peer = new Peer(config);
@@ -340,7 +345,7 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
         conn = peer.connect(targetRoomId);
         
         // Safety timeout: If PeerJS signals success but the router blocks the UDP channel
-        let dataChannelTimeout = setTimeout(() => {
+        dataChannelTimeout = setTimeout(() => {
             if (conn && !conn.open) {
                 peer.destroy();
                 statusText.innerText = "Router blocked tunnel. Try checking 'Force Cloud Relay'.";
@@ -351,7 +356,7 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
         }, 10000); // 10s wait for cloud relay negotiation
         
         conn.on('open', () => {
-            clearTimeout(dataChannelTimeout);
+            if (dataChannelTimeout) clearTimeout(dataChannelTimeout); // Tunnel succeeded, kill the timeout
             isPlayerOne = false;
             statusText.innerText = "Room found! Joining as Player 2...";
             statusText.classList.replace('text-yellow-400', 'text-green-400');
@@ -360,6 +365,9 @@ function attemptWebRTCConnection(targetRoomId, statusText, connectBtn) {
     });
 
     peer.on('error', (err) => {
+        // SURGICAL FIX: The room doesn't exist. Slay the ghost timeout so it doesn't assassinate the Host!
+        if (dataChannelTimeout) clearTimeout(dataChannelTimeout);
+
         if (err.type === 'peer-unavailable') {
             peer.destroy();
             statusText.innerText = "Creating room... Waiting for Player 2.";
