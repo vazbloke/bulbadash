@@ -100,14 +100,18 @@ const GAME_HEIGHT = 600;
 const TICK_RATE = 60; 
 const TICK_MS = 1000 / TICK_RATE; 
 
+// --- NEW CONFIGURABLE MECHANICS ---
+const LOCAL_INPUT_DELAY = 2; // Frames of delay before local input executes. Masks network latency!
+const DASH_CHARGE_TICKS = 3; // Frames of "Anime freeze" charge-up before the dash fires
+
 const PLAYER_SIZE = 32;
 const GRAVITY = 0.8;
 const JUMP_VELOCITY = -14;
 const MOVE_SPEED = 6;
 const DASH_SPEED = 18;
-const DASH_COOLDOWN_TICKS = 90; // 1.5 seconds at 60Hz
+const DASH_COOLDOWN_TICKS = 90;
 const DASH_DURATION_TICKS = 10;
-const HISTORY_BUFFER_SIZE = 120; // 2 seconds of history to hold in memory for rollbacks
+const HISTORY_BUFFER_SIZE = 120;
 
 const PLATFORMS = [
     { x: 0,   y: 550, w: 800, h: 50 },  // Floor
@@ -184,15 +188,20 @@ const peerConfig = {
 // SURGICAL FIX: Trimmed the ICE servers down to the absolute bare minimum. 
 // This prevents the WebRTC SDP Offer from becoming too large and being silently 
 // dropped by the PeerJS signaling server, which caused the "ICE: new" deadlock.
+// SURGICAL FIX: Restored full ICE server array. We need UDP and TCP fallbacks.
+// Note: If openrelayproject fails repeatedly, it is due to their free-tier rate limiting.
 function getDynamicPeerConfig() {
     const forceRelay = document.getElementById('toggle-relay') ? document.getElementById('toggle-relay').checked : false;
     
     return {
-        debug: 2,
+        debug: 3, // Max logging
         config: {
             iceTransportPolicy: forceRelay ? 'relay' : 'all',
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+                { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
                 { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }
             ]
         }
@@ -214,8 +223,11 @@ function createInitialState(startX, startY, startFacingX) {
         vy: 0,
         dashCooldown: 0,
         dashActiveTimer: 0,
+        dashChargeTimer: 0, // NEW
+        dashChargeDx: 0,    // NEW: Locks direction during charge
+        dashChargeDy: 0,    // NEW
         hits: 0,
-        lastDx: startFacingX, // Track last facing direction for bug-free stationary dashing
+        lastDx: startFacingX, 
         lastDy: 0
     };
 }
@@ -413,23 +425,18 @@ function setupConnectionEvents(connection, statusText, connectBtn) {
     const iceDisplay = document.getElementById('ice-state-display');
     iceDisplay.classList.remove('hidden');
 
-    // SURGICAL FIX: Native WebRTC Logging
-    // We wait 500ms for PeerJS to instantiate the raw RTCPeerConnection object, then hook into it.
+    // SURGICAL FIX: Native WebRTC Error Interception
+    // We wait 1000ms for the raw RTCPeerConnection to boot, then hook into it.
     setTimeout(() => {
         if (connection.peerConnection) {
-            connection.peerConnection.addEventListener('icegatheringstatechange', () => {
-                console.log(`[ICE Gathering]: ${connection.peerConnection.iceGatheringState}`);
-            });
-            connection.peerConnection.addEventListener('iceconnectionstatechange', () => {
-                console.log(`[ICE Connection]: ${connection.peerConnection.iceConnectionState}`);
-            });
-            connection.peerConnection.addEventListener('icecandidateerror', (event) => {
-                console.error(`[ICE Error]: ${event.errorText} on ${event.url}`);
-            });
-        } else {
-            console.warn("[ICE Debug] RTCPeerConnection object not found.");
+            connection.peerConnection.onicecandidateerror = (event) => {
+                console.error("Raw ICE Error:", event);
+                // Print the exact network rejection reason to the UI
+                statusText.innerText = `Network Blocked: Port/Firewall issue. Check Console.`;
+                statusText.classList.replace('text-green-400', 'text-red-400');
+            };
         }
-    }, 500);
+    }, 1000);
 
     let diagInterval = setInterval(() => {
         if (connection.peerConnection) {
@@ -438,6 +445,13 @@ function setupConnectionEvents(connection, statusText, connectBtn) {
             
             if (state === 'failed' || state === 'disconnected') {
                 iceDisplay.classList.add('text-red-400');
+                if (state === 'failed') {
+                    clearInterval(diagInterval);
+                    statusText.innerText = "Connection blocked by router firewall (NAT).";
+                    statusText.classList.replace('text-green-400', 'text-red-400');
+                    connectBtn.disabled = false;
+                    connectBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                }
             } else {
                 iceDisplay.classList.remove('text-red-400');
             }
@@ -477,7 +491,6 @@ function applyPlayerPhysics(state, input) {
     if (nextState.dashCooldown > 0) nextState.dashCooldown--;
     if (nextState.dashActiveTimer > 0) nextState.dashActiveTimer--;
 
-    // Keep track of the last intended direction for stationary dashes
     let dx = 0; let dy = 0;
     if (input.left) dx = -1; else if (input.right) dx = 1;
     if (input.up) dy = -1; else if (input.down) dy = 1;
@@ -487,25 +500,28 @@ function applyPlayerPhysics(state, input) {
         nextState.lastDy = dy;
     }
 
-    if (input.dash && nextState.dashCooldown === 0) {
-        nextState.dashActiveTimer = DASH_DURATION_TICKS;
+    // SURGICAL FIX: Dash Charge Mechanics
+    if (input.dash && nextState.dashCooldown === 0 && nextState.dashChargeTimer === 0 && nextState.dashActiveTimer === 0) {
+        nextState.dashChargeTimer = DASH_CHARGE_TICKS;
         nextState.dashCooldown = DASH_COOLDOWN_TICKS;
-        
-        let dashDx = dx;
-        let dashDy = dy;
-        
-        // BUGFIX: If no direction is held during dash, dash towards the last saved facing direction
-        if (dashDx === 0 && dashDy === 0) {
-            dashDx = nextState.lastDx;
-            dashDy = nextState.lastDy;
-        }
-
-        let length = Math.sqrt(dashDx*dashDx + dashDy*dashDy);
-        nextState.vx = (dashDx / length) * DASH_SPEED;
-        nextState.vy = (dashDy / length) * DASH_SPEED;
+        nextState.dashChargeDx = dx === 0 && dy === 0 ? nextState.lastDx : dx;
+        nextState.dashChargeDy = dx === 0 && dy === 0 ? nextState.lastDy : dy;
     }
 
-    if (nextState.dashActiveTimer === 0) {
+    // Process Charge or Movement
+    if (nextState.dashChargeTimer > 0) {
+        nextState.dashChargeTimer--;
+        nextState.vx = 0; // Freeze in place for impact!
+        nextState.vy = 0;
+        
+        if (nextState.dashChargeTimer === 0) {
+            // Unleash the dash
+            nextState.dashActiveTimer = DASH_DURATION_TICKS;
+            let length = Math.sqrt(nextState.dashChargeDx*nextState.dashChargeDx + nextState.dashChargeDy*nextState.dashChargeDy);
+            nextState.vx = (nextState.dashChargeDx / length) * DASH_SPEED;
+            nextState.vy = (nextState.dashChargeDy / length) * DASH_SPEED;
+        }
+    } else if (nextState.dashActiveTimer === 0) {
         if (input.left) nextState.vx = -MOVE_SPEED;
         else if (input.right) nextState.vx = MOVE_SPEED;
         else nextState.vx = 0; 
@@ -535,11 +551,12 @@ function applyPlayerPhysics(state, input) {
         nextState.vy = JUMP_VELOCITY;
     }
 
-    if (nextState.x < 0) nextState.x = 0;
-    if (nextState.x > GAME_WIDTH - PLAYER_SIZE) nextState.x = GAME_WIDTH - PLAYER_SIZE;
+    // Screen Wrap Logic (Replacing hard walls)
+    if (nextState.x < -PLAYER_SIZE) nextState.x = GAME_WIDTH;
+    else if (nextState.x > GAME_WIDTH) nextState.x = -PLAYER_SIZE;
+    
     if (nextState.y < 0) nextState.y = 0;
     
-    // Death barrier respawn
     if (nextState.y > GAME_HEIGHT) {
         nextState.x = 400; nextState.y = 100; nextState.vy = 0;
     }
@@ -623,6 +640,14 @@ function handleNetworkData(payload) {
 
     // If reality fractured, activate the Time Machine
     if (earliestMismatch !== -1) {
+        let rollbackDepth = currentTick - earliestMismatch;
+        
+        // SURGICAL FIX: Quantum Decoherence Trigger
+        // If the rollback is severe (5+ frames), trigger the glitch effect
+        if (rollbackDepth >= 5 && window.triggerDecoherence) {
+            window.triggerDecoherence();
+        }
+        
         executeRollback(earliestMismatch);
     }
 }
@@ -692,7 +717,7 @@ function tick() {
     if ((keys.up && keys.up.isDown) || window.touchState.jump) isJumpPressed = true;
     if ((keys.dash && keys.dash.isDown) || window.touchState.dash) isDashPressed = true;
 
-    // 2. FIX 2: Check Native HTML5 Gamepad API (Bypasses Phaser's delayed Android Handheld detection)
+    // 2. Check Native HTML5 Gamepad API (Bypasses Phaser's delayed Android Handheld detection)
     if (navigator.getGamepads) {
         let pads = navigator.getGamepads();
         for (let i = 0; i < pads.length; i++) {
@@ -730,33 +755,45 @@ function tick() {
     prevJumpState = isJumpPressed;
     prevDashState = isDashPressed;
 
-    // Gather Local Input
-    const localInput = {
-        left: padState.left,
-        right: padState.right,
-        up: padState.up, 
-        down: padState.down,
-        jump: jumpJustPressed, 
-        dash: dashJustPressed,
-        isPredicted: false // This is absolute truth (our own input)
+    // Gather Local Input from Hardware
+    const hardwareInput = {
+        left: padState.left, right: padState.right,
+        up: padState.up, down: padState.down,
+        jump: jumpJustPressed, dash: dashJustPressed,
+        isPredicted: false 
     };
 
-    if (!inputHistory[currentTick]) inputHistory[currentTick] = { p1: null, p2: null };
+    // SURGICAL FIX: Local Input Delay
+    // We sample hardware now, but schedule it to execute 'N' frames in the future.
+    let targetTick = currentTick + LOCAL_INPUT_DELAY;
     
-    // Save local input to the correct history array slot
-    if (isPlayerOne) inputHistory[currentTick].p1 = localInput;
-    else inputHistory[currentTick].p2 = localInput;
+    if (!inputHistory[currentTick]) inputHistory[currentTick] = { p1: null, p2: null };
+    if (!inputHistory[targetTick]) inputHistory[targetTick] = { p1: null, p2: null };
 
-    // Send local input across the network immediately (with a 10-frame redundancy buffer for packet loss)
+    // Save hardware input to the FUTURE tick
+    if (isPlayerOne) inputHistory[targetTick].p1 = hardwareInput;
+    else inputHistory[targetTick].p2 = hardwareInput;
+
+    // Send immediately over the network (tagged with the future tick)
     if (conn && conn.open) {
-        localInputQueue.push({ tick: currentTick, input: localInput });
+        localInputQueue.push({ tick: targetTick, input: hardwareInput });
         if (localInputQueue.length > 10) localInputQueue.shift(); 
         conn.send({ type: 'inputs', data: localInputQueue });
     }
 
+    // Retrieve what was scheduled to execute for the CURRENT tick
+    let currentLocalInput = isPlayerOne ? inputHistory[currentTick].p1 : inputHistory[currentTick].p2;
+    
+    // If the game just booted, the buffer is empty, so we inject empty inputs
+    if (!currentLocalInput) {
+        currentLocalInput = { left: false, right: false, up: false, down: false, jump: false, dash: false, isPredicted: false };
+        if (isPlayerOne) inputHistory[currentTick].p1 = currentLocalInput;
+        else inputHistory[currentTick].p2 = currentLocalInput;
+    }
+
     // PREDICT the opponent's input since it hasn't arrived over the internet yet.
     // We assume they just keep holding the same directional buttons they held last frame.
-    const prevRemoteInput = isPlayerOne ? inputHistory[currentTick - 1].p2 : inputHistory[currentTick - 1].p1;
+    const prevRemoteInput = isPlayerOne ? inputHistory[currentTick - 1]?.p2 : inputHistory[currentTick - 1]?.p1;
     let predictedRemoteInput = { 
         left: prevRemoteInput ? prevRemoteInput.left : false, 
         right: prevRemoteInput ? prevRemoteInput.right : false,
@@ -771,7 +808,7 @@ function tick() {
     gameState = stepPhysics(gameState, inputHistory[currentTick].p1, inputHistory[currentTick].p2);
     stateHistory[currentTick] = JSON.parse(JSON.stringify(gameState));
     
-    // Memory cleanup: Forget history older than 2 seconds to prevent memory leaks
+    // Memory cleanup: Forget history older than the buffer to prevent memory leaks
     if (currentTick > HISTORY_BUFFER_SIZE) {
         delete stateHistory[currentTick - HISTORY_BUFFER_SIZE];
         delete inputHistory[currentTick - HISTORY_BUFFER_SIZE];
@@ -779,7 +816,6 @@ function tick() {
     
     updateScores(gameState.p1.hits, gameState.p2.hits);
 }
-
 function updateScores(p1Hits, p2Hits) {
     document.getElementById('score-p1').innerText = p1Hits;
     document.getElementById('score-p2').innerText = p2Hits;
@@ -800,20 +836,50 @@ function startGame() {
     window.gameIsActive = true;
     const config = {
         type: Phaser.AUTO,
-        width: GAME_WIDTH,
-        height: GAME_HEIGHT,
-        parent: 'game-container',
         backgroundColor: '#2d3748',
         input: { gamepad: true },
+        // Phaser Scale Manager fixes Android clipping
+        scale: {
+            mode: Phaser.Scale.FIT,
+            autoCenter: Phaser.Scale.CENTER_BOTH,
+            width: GAME_WIDTH,
+            height: GAME_HEIGHT,
+            parent: 'game-container'
+        },
         scene: { preload: preload, create: create, update: update }
     };
-    phaserGame = new Phaser.Game(config); // SURGICAL FIX: Bind securely to global variable
+    phaserGame = new Phaser.Game(config); 
 }
 
 function preload() {}
 
 function create() {
+    // Quantum Decoherence Glitch FX
+    window.triggerDecoherence = () => {
+        // Create corrupted reality "ghosts" that violently expand and fade
+        for(let i=0; i<3; i++) {
+            let glitchOffsetX = Phaser.Math.Between(-20, 20);
+            let glitchOffsetY = Phaser.Math.Between(-20, 20);
+            
+            let ghostP1 = this.add.rectangle(spriteP1.x + glitchOffsetX, spriteP1.y + glitchOffsetY, PLAYER_SIZE, PLAYER_SIZE, 0xf43f5e).setOrigin(0,0).setAlpha(0.7);
+            let ghostP2 = this.add.rectangle(spriteP2.x + glitchOffsetX, spriteP2.y + glitchOffsetY, PLAYER_SIZE, PLAYER_SIZE, 0x3b82f6).setOrigin(0,0).setAlpha(0.7);
+            
+            ghostP1.setBlendMode(Phaser.BlendModes.ADD);
+            ghostP2.setBlendMode(Phaser.BlendModes.ADD);
+
+            this.tweens.add({
+                targets: [ghostP1, ghostP2],
+                scaleX: 1.8, scaleY: 1.8, alpha: 0,
+                x: '+=10', y: '-=10', // Drift slightly
+                duration: 250 + Phaser.Math.Between(0, 150),
+                ease: 'Expo.easeOut',
+                onComplete: () => { ghostP1.destroy(); ghostP2.destroy(); }
+            });
+        }
+    };
+
     let graphics = this.add.graphics();
+
     graphics.fillStyle(0x4a5568, 1);
     for(let plat of PLATFORMS) {
         graphics.fillRect(plat.x, plat.y, plat.w, plat.h);
